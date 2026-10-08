@@ -1,8 +1,8 @@
 import io
 """
 Pure-Python XZ / LZMA2 Streaming Decompression Engine.
-Conforms to Technical Specification Revision 3.0.0.
-Zero external dependencies. Compatible with MicroPython, PyPy, and CPython.
+Zero required external dependencies, apart from --test mode.
+Normal operation compatible with MicroPython, PyPy, and CPython.
 """
 
 import sys
