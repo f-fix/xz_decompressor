@@ -1,4 +1,4 @@
-# xz_decompressor
+# XZ Decompressor (`xz_decompressor`)
 pure-python xz / lzma2 streaming decompressor with resumption
 
 Target Environments: MicroPython, PyPy 3, CPython 3.8+
@@ -11,7 +11,7 @@ This specification defines the architecture, wire protocols, storage model, faul
 
 Revision 4 incorporates comprehensive deadline, wall-clock timeout, and CPU timeout capabilities with dual-layer enforcement:
 1. **Asynchronous Preemptive Signals**: Utilizing POSIX `SIGALRM` and `SIGVTALRM` (via `setitimer` or `alarm`) where supported.
-2. **Cooperative Event-Loop Polling ("Slightly Early")**: Enforcing timeouts at event boundaries across all platforms with a small safety margin ($\sim 150-200\text{ ms}$) prior to deadline expiry, ensuring clean state persistence and resumption command output before external supervisors trigger abrupt termination.
+2. **Cooperative Event-Loop Polling ("Slightly Early")**: Enforcing timeouts at event boundaries across all platforms with a small safety margin (~150–200 ms) prior to deadline expiry, ensuring clean state persistence and resumption command output before external supervisors trigger abrupt termination.
 3. **Flexible ISO-8601 UTC Parser**: Supporting bare dates, compact notation, optional punctuation (`-`, `:`, `T`, `Z`), and variable time granularities (hours, minutes, seconds, subsecond fractions) across CPython, PyPy, and MicroPython.
 
 ```
@@ -53,15 +53,15 @@ Revision 4 incorporates comprehensive deadline, wall-clock timeout, and CPU time
 ## 2. Block-Level Decoding Execution Invariants
 
 ### 2.1 The Active Working Block Buffer (`cur_block`)
-1. **Buffer Allocation**: The decompressor allocates an active decoding working buffer `cur_block = bytearray(block_size)`, where `block_size` is typically 64 KiB ($65,536$ bytes), or a caller-configured block size between 4 KiB and 64 KiB.
+1. **Buffer Allocation**: The decompressor allocates an active decoding working buffer `cur_block = bytearray(block_size)`, where `block_size` is typically 64 KiB (65,536 bytes), or a caller-configured block size between 4 KiB and 64 KiB.
 2. **Zero-Call Intra-Block Decoding**:
    - **Literals**: Directly assigned into `cur_block[pos] = symbol` at native C-extension speed.
-   - **Local Matches ($distance \le pos$)**:
-     - *RLE ($distance = 1$)*: Expanded via `cur_block[pos : pos + length] = bytes([cur_block[pos - 1]]) * length`.
-     - *Non-Overlapping ($distance \ge length$)*: Direct slice assignment `cur_block[pos : pos + length] = cur_block[pos - dist : pos - dist + length]`.
-     - *Overlapping ($distance < length$)*: Fast unrolled loop or repeated slice multiplication within `cur_block`.
-   - Over 95% of LZMA matches in typical streams are local ($distance \le pos$), completely eliminating backend lookup calls during active block execution.
-3. **Inter-Block Matches ($distance > pos$)**:
+   - **Local Matches (`distance <= pos`)**:
+     - *RLE (`distance == 1`)*: Expanded via `cur_block[pos : pos + length] = bytes([cur_block[pos - 1]]) * length`.
+     - *Non-Overlapping (`distance >= length`)*: Direct slice assignment `cur_block[pos : pos + length] = cur_block[pos - dist : pos - dist + length]`.
+     - *Overlapping (`distance < length`)*: Fast unrolled loop or repeated slice multiplication within `cur_block`.
+   - Over 95% of LZMA matches in typical streams are local (`distance <= pos`), completely eliminating backend lookup calls during active block execution.
+3. **Inter-Block Matches (`distance > pos`)**:
    - When an LZMA match references history spanning prior blocks, the engine calculates the slice boundary and fetches the necessary byte slice from the pluggable backend:
      ```python
      needed_len = min(length, distance - pos)
@@ -114,8 +114,8 @@ class HistoryBackend:
 ### 3.2 Concrete Backend Implementations
 
 #### A. `DirectoryBlockHistoryStore` (Default Standalone CLI Backend)
-- **Topology**: Maintains up to 1025 discrete 64 KiB files on disk in a dedicated working directory ($1024 \times 64\text{ KiB} = 64\text{ MiB}$ sliding history window + 1 active block).
-- **FIFO Eviction**: When block index $k$ is committed, if $k \ge 1025$, all files associated with block $k - 1025$ (`*.block`, `*.state`) are deleted.
+- **Topology**: Maintains up to 1025 discrete 64 KiB files on disk in a dedicated working directory (1024 * 64 KiB = 64 MiB sliding history window + 1 active block).
+- **FIFO Eviction**: When block index `k` is committed, if `k >= 1025`, all files associated with block `k - 1025` (`*.block`, `*.state`) are deleted.
 - **Atomic File Writing**:
   1. Block data written to `.tmp_<hash>_<index:08d>.block` and companion state to `.tmp_<hash>_<index:08d>.state`.
   2. Flushed and atomically moved into place using `os.replace`.
@@ -141,7 +141,7 @@ class HistoryBackend:
    - Sets wall-clock timeout relative to process startup.
    - Values: integer or float followed by `s` (seconds) or `m` (minutes), or literal `0` (disables wall-clock timeout). Case-insensitive suffix.
    - At startup, initial `time.perf_counter()` is captured and subtracted from `--timeout`:
-     $$\text{wall\_remaining} = \text{timeout\_sec} - (\text{time.perf\_counter()} - \text{init\_perf})$$
+     `wall_remaining = timeout_sec - (time.perf_counter() - init_perf)`
 2. `--deadline=<iso-8601-timestamp>Z`:
    - Sets an absolute UTC deadline instant.
    - Supported notations (case-insensitive for `T` and `Z`, all punctuation `-`, `:`, `T`, `Z` optional):
@@ -151,13 +151,13 @@ class HistoryBackend:
      - Date, hours, minutes, seconds: `YYYYMMDDHHMMSS`, `YYYY-MM-DDTHH:MM:SSZ`.
      - Date, hours, minutes, seconds, subsecond fractions: `YYYYMMDDHHMMSS.fff`, `YYYY-MM-DDTHH:MM:SS.fffZ`.
    - Resolves to:
-     $$\text{deadline\_remaining} = \max(0.0,\; \text{deadline\_epoch} - \text{now\_epoch})$$
+     `deadline_remaining = max(0.0, deadline_epoch - now_epoch)`
    - If both `--timeout` and `--deadline` are supplied, the effective wall-clock duration resolves to the stricter (earlier) instant:
-     $$\text{effective\_timeout} = \min(\text{timeout\_sec},\; \text{deadline\_remaining})$$
+     `effective_timeout = min(timeout_sec, deadline_remaining)`
 3. `--cpu-timeout=[<N>s|<N>m|0]` (Default: `22s`):
    - Sets process CPU time timeout.
    - Initial `time.process_time()` is captured and subtracted:
-     $$\text{cpu\_remaining} = \text{cpu\_timeout\_sec} - (\text{time.process\_time()} - \text{init\_cpu})$$
+     `cpu_remaining = cpu_timeout_sec - (time.process_time() - init_cpu)`
 
 ### 4.2 Dual-Layer Enforcement Mechanism
 - **Preemptive Asynchronous Signals**:
@@ -166,9 +166,9 @@ class HistoryBackend:
   - Platforms without signals (Windows, MicroPython, non-main threads) gracefully bypass signal registration without failure.
 - **Cooperative Clock-Checking ("Slightly Early")**:
   - Enforced on all platforms inside the CLI event loop on every decompressor event.
-  - Uses a safety margin $\Delta \approx 150-200\text{ ms}$:
-    $$\text{wall\_elapsed} \ge \text{timeout\_sec} - 0.15$$
-    $$\text{cpu\_elapsed} \ge \text{cpu\_timeout\_sec} - 0.15$$
+  - Uses a safety margin of ~150–200 ms:
+    `wall_elapsed >= timeout_sec - 0.15`
+    `cpu_elapsed >= cpu_timeout_sec - 0.15`
   - Exiting slightly early guarantees that the process commits active state, preserves `.part` files, emits the resumption message to `sys.stderr`, and exits before external supervisors issue hard termination.
 
 ### 4.3 Interruption Output & Exit Code
@@ -185,7 +185,7 @@ Upon wall-clock or CPU timeout:
 ## 5. Multi-Stream XZ Handling & Stream Boundary Semantics
 
 - Concatenated XZ streams are permitted to have 0 to any multiple of 4 bytes null padding (`0x00`) per RFC §2.1.2.
-- Stream 0 writes to `<base>`, stream $K \ge 1$ writes to `<base>_<K><ext>`.
+- Stream 0 writes to `<base>`, stream `K >= 1` writes to `<base>_<K><ext>`.
 - Boundary telemetry emitted to `sys.stderr`:
   - Normal files: `[xz:stream boundary] input_offset=...B stream_in=...B stream_out=...B output_offset=...B starting stream <K> -> <target>`
   - Non-files: `[xz:stream boundary] input_offset=...B stream_in=...B stream_out=...B output_offset=...B starting stream <K> -> <target>+<offset>B`
@@ -194,7 +194,7 @@ Upon wall-clock or CPU timeout:
 
 ## 6. Staging, Filename Resolution & In-Place Directives
 
-- Auto-naming: case-insensitive `<base>.xz`/`<base>.lzma` $\implies$ `<base>`, `-` $\implies$ `stdin.unxz`, fallback `<name>.unxz`.
+- Auto-naming: case-insensitive `<base>.xz`/`<base>.lzma` -> `<base>`, `-` -> `stdin.unxz`, fallback `<name>.unxz`.
 - Staged as `<target>.part`, atomically renamed to `<target>` on stream completion. Unlinks stale `.part` on non-resuming runs.
 - Direct `--in-place` mode writes directly without `.part` intermediaries.
 - Resumption stream-0 invariant: always invoked with base stream-0 filename.
