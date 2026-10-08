@@ -1,10 +1,7 @@
 # xz_decompressor
-pure-python resumable xz/lzma2 decompressor
+pure-python xz / lzma2 streaming decompressor with resumption
 
-# Pure-Python XZ / LZMA2 Streaming Decompression Engine
-## Technical Specification & Architecture Standard (Revision 4)
-### Document Version: 4.0.0
-### Target Environments: MicroPython, PyPy 3, CPython 3.8+
+Target Environments: MicroPython, PyPy 3, CPython 3.8+
 
 ---
 
