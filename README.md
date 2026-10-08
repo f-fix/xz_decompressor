@@ -1,25 +1,32 @@
 # XZ Decompressor (`xz_decompressor`)
-pure-python xz / lzma2 streaming decompressor with resumption
+Pure-Python XZ / LZMA2 Streaming Decompressor with Resumption
 
-Target Environments: MicroPython, PyPy 3, CPython 3.8+
+Target Environments: MicroPython, PyPy 3, CPython 3.8+  
+Authoritative Standard: The .xz File Format Specification (v1.2.0 / RFC §2 & §3)  
+Revision: 5 (Comprehensive Container Validation, Filter Framing, and Resumption Engine)
 
 ---
 
-## 1. System Architecture & High-Performance Block Execution Model
+## 1. System Architecture & Scope Definition
 
-This specification defines the architecture, wire protocols, storage model, fault tolerance, and event-driven lifecycle for a zero-dependency, pure-Python XZ (LZMA2) decompression engine.
+This specification defines the architecture, wire protocols, integrity verification, storage model, fault tolerance, and event-driven lifecycle for a zero-dependency, pure-Python XZ streaming decompression engine.
 
-Revision 4 incorporates comprehensive deadline, wall-clock timeout, and CPU timeout capabilities with dual-layer enforcement:
-1. **Asynchronous Preemptive Signals**: Utilizing POSIX `SIGALRM` and `SIGVTALRM` (via `setitimer` or `alarm`) where supported.
-2. **Cooperative Event-Loop Polling ("Slightly Early")**: Enforcing timeouts at event boundaries across all platforms with a small safety margin (~150–200 ms) prior to deadline expiry, ensuring clean state persistence and resumption command output before external supervisors trigger abrupt termination.
-3. **Flexible ISO-8601 UTC Parser**: Supporting bare dates, compact notation, optional punctuation (`-`, `:`, `T`, `Z`), and variable time granularities (hours, minutes, seconds, subsecond fractions) across CPython, PyPy, and MicroPython.
+### 1.1 Wire Format Scope & Boundaries
+- **Supported Primary Container**: The .xz File Format Specification (v1.2.0 / RFC §2 & §3), supporting multi-stream concatenation, variable null padding, and arbitrary multi-block structures.
+- **Supported Filter**: LZMA2 (`Filter ID 0x21`) with arbitrary dictionary sizes up to 64 MiB (dynamically bounded by filter properties).
+- **Unsupported Legacy Container (`.lzma`)**: The legacy 13-byte raw LZMA header format (ALZ / LZMA1 SDK) is **not** supported by this engine. Filename convenience mappings accept `.lzma` input paths solely for CLI compatibility, but the input byte stream must conform to the XZ container format. Non-XZ streams must raise `E_FORMAT` immediately upon encountering invalid stream magic.
+- **Unsupported Secondary Filters**: Branch/Call/Jump (BCJ) executable filters (`Filter IDs 0x04`–`0x0B`) and the Delta filter (`Filter ID 0x03`) are not included in the default zero-dependency engine. Blocks specifying filter counts greater than 1 or non-LZMA2 filter IDs must be cleanly rejected with `E_UNSUPPORTED` rather than silently decoding corrupted output.
 
-```
+### 1.2 Architectural Diagram
+
+```text
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                        CORE PURE-PYTHON XZ / LZMA2 ENGINE                              │
 │  • Pure computational range decoding, LZMA2 chunk parsing, probability arithmetic      │
+│  • Normative Block Header parsing (Flags, VLI sizes, LZMA2 dictionary property)        │
+│  • Mandatory Block Check computation (CRC32, CRC64, SHA-256) on uncompressed data      │
+│  • Complete Index & Stream Footer verification (Backward Size, CRC32, Flag symmetry)   │
 │  • Decodes directly into internal active block buffer (4 KiB to 64 KiB bytearray)      │
-│  • Local matches resolved via fast in-memory C slice copies (no method calls)          │
 │  • Interacts with HistoryBackend via block-level slices (get_history_slice / append)   │
 │  • Emits cooperative lifecycle events via block-level generator yielding               │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘
@@ -36,11 +43,12 @@ Revision 4 incorporates comprehensive deadline, wall-clock timeout, and CPU time
 │        STANDALONE CLI DRIVER         │          │       EMBEDDED / CALLER DRIVER       │
 │        (Target: CLI Utility)         │          │     (In-Memory / Streaming Tar)      │
 ├──────────────────────────────────────┤          ├──────────────────────────────────────┤
-│ • 1025-block DirectoryStateStore     │          │ • Single-file FileHistory / MemHist  │
+│ • DirectoryBlockHistoryStore         │          │ • Single-file FileHistory / MemHist  │
 │ • Splits output_0.bin, output_1.bin  │          │ • Streams TAR chunks to unbundler    │
-│ • Manages .part staging & --in-place │          │ • Transitions between VS streams 0/1 │
-│ • Dual-Layer Watchdog:               │          │ • Services watchdog heartbeat        │
-│   - --timeout (SIGALRM + coop)       │          │ • Zero disk hops                     │
+│ • Manages .part staging & --in-place │          │ • Transitions between streams 0/1    │
+│ • Verify-Output Resumption Engine    │          │ • Services watchdog heartbeat        │
+│ • Dual-Layer Watchdog:               │          │ • Zero disk hops                     │
+│   - --timeout (SIGALRM + coop)       │          │                                      │
 │   - --cpu-timeout (SIGVTALRM + coop) │          │                                      │
 │   - --deadline (ISO-8601 UTC)        │          │                                      │
 │ • Prints stderr boundary telemetry   │          │                                      │
@@ -57,10 +65,10 @@ Revision 4 incorporates comprehensive deadline, wall-clock timeout, and CPU time
 2. **Zero-Call Intra-Block Decoding**:
    - **Literals**: Directly assigned into `cur_block[pos] = symbol` at native C-extension speed.
    - **Local Matches (`distance <= pos`)**:
-     - *RLE (`distance == 1`)*: Expanded via `cur_block[pos : pos + length] = bytes([cur_block[pos - 1]]) * length`.
+     - *Run-Length Encoding (`distance == 1`)*: Expanded via `cur_block[pos : pos + length] = bytes([cur_block[pos - 1]]) * length`.
      - *Non-Overlapping (`distance >= length`)*: Direct slice assignment `cur_block[pos : pos + length] = cur_block[pos - dist : pos - dist + length]`.
-     - *Overlapping (`distance < length`)*: Fast unrolled loop or repeated slice multiplication within `cur_block`.
-   - Over 95% of LZMA matches in typical streams are local (`distance <= pos`), completely eliminating backend lookup calls during active block execution.
+     - *Overlapping (`distance < length`)*: Fast unrolled copy or repeated slice multiplication within `cur_block`.
+   - Over 95% of LZMA matches in typical streams are local (`distance <= pos`), eliminating backend lookup calls during active block execution.
 3. **Inter-Block Matches (`distance > pos`)**:
    - When an LZMA match references history spanning prior blocks, the engine calculates the slice boundary and fetches the necessary byte slice from the pluggable backend:
      ```python
@@ -73,41 +81,92 @@ Revision 4 incorporates comprehensive deadline, wall-clock timeout, and CPU time
    - If the input source is a network socket, pipe, or small payload yielding partial data, the decompressor does not stall waiting for a full 64 KiB buffer.
    - Slices as small as 1 byte are flushed and yielded cleanly when an explicit chunk boundary, end-of-stream, or caller flush is encountered.
 
+### 2.2 Normative Block Header Parsing & Validation
+Every block within an XZ stream must begin with a valid Block Header conforming to XZ spec §3.1:
+1. **Header Size**: Extracted from the first byte as `(first_byte + 1) * 4` bytes.
+2. **Header CRC32**: The last 4 bytes of the header are a 32-bit little-endian CRC32 calculated over all preceding bytes of the Block Header. Decoders must verify this CRC32 prior to parsing inner fields, raising `E_CHECK` on failure.
+3. **Block Flags (Byte 1)**:
+   - **Filter Count (Bits 0–1)**: `count = (flags & 0x03) + 1`. This engine supports single-filter streams (`count == 1`). Streams declaring multiple filters (`count > 1`) must raise `E_UNSUPPORTED`.
+   - **Reserved Bits (Bits 2–5)**: Must be `0`. Any non-zero bits must raise `E_FORMAT`.
+   - **Compressed Size Present (Bit 6)**: If set, a Variable Length Integer (VLI) is present indicating the total compressed size of the block. If present, the engine must verify that total compressed bytes consumed match this value.
+   - **Uncompressed Size Present (Bit 7)**: If set, a VLI is present indicating the expected decompressed size of the block. If present, the engine must verify that total uncompressed bytes produced match this value.
+4. **Filter Flags**:
+   - **Filter ID**: Encoded as a VLI. Must equal `0x21` (LZMA2). Any other filter ID must raise `E_UNSUPPORTED`.
+   - **Size of Properties**: Encoded as a VLI. Must equal `1` for LZMA2.
+   - **Filter Properties (1 byte)**: Encodes the LZMA2 dictionary size `D` (`bits 0-5`):
+     ```python
+     bits = prop_byte & 0x3F
+     if bits == 40:
+         dict_size = 0xFFFFFFFF
+     elif bits < 40:
+         dict_size = (2 | (bits & 1)) << (bits // 2 + 11)
+     else:
+         raise ValueError('Invalid LZMA2 dictionary property')
+     ```
+     The engine must configure `HistoryBackend.max_history` to allocate at least `min(dict_size, 67108864)` bytes.
+5. **Header Padding**: Null bytes (0–3 bytes) aligning the header fields to a 4-byte boundary before the CRC32.
+
+### 2.3 Mandatory Block Check Verification
+1. **Check Type Identification**: Configured by Bits 0–3 of the Stream Header Flags:
+   - `0x00`: None (0 bytes).
+   - `0x01`: CRC32 (4 bytes).
+   - `0x04`: CRC64 (8 bytes).
+   - `0x0A`: SHA-256 (32 bytes).
+   - Any other value is reserved and must raise `E_UNSUPPORTED`.
+2. **Payload Check Computation**: During block execution, the engine must compute a continuous running check over all **uncompressed output bytes** emitted by the block.
+3. **Check Comparison**: Following block stream termination and 4-byte compressed padding alignment, the engine reads `check_size` bytes from the input and asserts equality against the computed check. A mismatch must raise `E_CHECK`.
+
+### 2.4 LZMA2 Chunk Execution & Reset Semantics
+LZMA2 packages data into discrete chunks prefixed by a 1-byte control byte (`ctrl`):
+1. **End-of-Payload (`ctrl == 0x00`)**: Signals normal termination of the LZMA2 stream for the current block.
+2. **Uncompressed Chunks (`ctrl in (0x01, 0x02)`)**:
+   - `ctrl == 0x01`: **Uncompressed with Dictionary Reset**. The engine must invoke `history.reset()` and reset repeat match distances (`reps = [0, 0, 0, 0]`).
+   - `ctrl == 0x02`: **Uncompressed without Dictionary Reset**. History and repeat match distances are retained.
+3. **LZMA Compressed Chunks (`ctrl >= 0x80`)**:
+   - High 5 bits of uncompressed size: `(ctrl & 0x1F) << 16`.
+   - Mode bits: `mode = (ctrl >> 5) & 3`.
+     - `mode == 0` (`00b`): Keep state, keep properties, keep dictionary.
+     - `mode == 1` (`01b`): **Reset State**. Set `state = 0` and reinitialize all probability models (`p_is_match`, `p_is_rep`, `p_pos_slot`, `p_align`, `p_len`, `p_rep_len`) to `PROB_INIT = 1024`.
+     - `mode == 2` (`10b`): **Reset State & Properties**. Perform Mode 1 actions, consume 1 property byte (`prop_byte`), recompute `pb`, `lp`, `lc`, and reallocate/reinitialize literal probability array `p_lit`.
+     - `mode == 3` (`11b`): **Reset State, Properties & Dictionary**. Perform Mode 2 actions, invoke `history.reset()`, and reset repeat distances (`reps = [0, 0, 0, 0]`).
+4. **Inter-Block Isolation**:
+   - In multi-block streams, each Block represents an independent filter execution. LZMA state, probabilities, and sliding history must not bleed across block boundaries. The first chunk of every block must perform a dictionary and state reset (`ctrl == 0x01` or `mode == 3`).
+
 ---
 
 ## 3. Pluggable Block-Level Storage Protocol (`HistoryBackend`)
 
-The decompressor is decoupled from storage through an abstract, block-level protocol:
+The decompressor is decoupled from physical storage through an abstract, block-level protocol:
 
 ### 3.1 Abstract Protocol Definition
 ```python
 class HistoryBackend:
-    def append_block(self, block_data: bytes, block_index: int = 0, input_hash: str = "") -> None:
-        """Commit completed uncompressed block to history."""
+    def append_block(self, block_data: bytes, block_index: int = 0, input_hash: str = '') -> None:
+        # Commit completed uncompressed block to history.
         raise NotImplementedError
 
     def get_history_slice(self, distance: int, length: int) -> bytes:
-        """Retrieve contiguous byte slice from past history."""
+        # Retrieve contiguous byte slice from past history.
         raise NotImplementedError
 
-    def checkpoint(self, block_index: int, state_record: dict, input_hash: str = "") -> None:
-        """Persist decompression state at block boundary."""
+    def checkpoint(self, block_index: int, state_record: dict, input_hash: str = '') -> None:
+        # Persist decompression metadata bookmark at block boundary.
         pass
 
     def restore(self, block_index: int) -> dict:
-        """Load decompression state for block_index."""
+        # Load decompression metadata for block_index.
         return None
 
     def evict_prior(self, min_retained_block: int) -> None:
-        """Purge blocks older than min_retained_block from circular buffer."""
+        # Purge blocks older than min_retained_block from circular buffer.
         pass
 
     def reset(self) -> None:
-        """Reset history state between streams while keeping directories intact."""
+        # Reset history state between streams or upon LZMA2 dictionary reset.
         pass
 
     def cleanup(self) -> None:
-        """Release backend resources upon successful completion."""
+        # Release backend resources upon successful completion.
         pass
 ```
 
@@ -120,9 +179,7 @@ class HistoryBackend:
   1. Block data written to `.tmp_<hash>_<index:08d>.block` and companion state to `.tmp_<hash>_<index:08d>.state`.
   2. Flushed and atomically moved into place using `os.replace`.
 - **LRU Block Cache**: In RAM, keeps an LRU cache of 1 to 2 recent 64 KiB history blocks to eliminate disk seeks for nearby inter-block lookbacks.
-- **Crash Recovery & Verify-Output Mode**:
-  - Direct resume when valid `.state` and history exist.
-  - If state is missing, corrupted, or incomplete: restarts from block 0 in **Verify-Output Mode**, comparing each 64 KiB block against the existing partial output file. Upon the first mismatch, the output file is truncated immediately to that block boundary, transitioning to normal appended output.
+- **State Bookmarks**: Companion `.state` files store JSON metadata (`block_idx`, `input_hash`, `output_offset`, `uncompressed_len`) acting as audit checkpoints.
 
 #### B. `FileHistory` (Single-File Scratch CAS)
 - Backed by a single scratch file (e.g. `.history.tmp`) with an internal LRU page cache.
@@ -131,6 +188,15 @@ class HistoryBackend:
 #### C. `MemoryHistory` (In-Memory Ring Buffer)
 - Backed by an in-memory `bytearray` ring buffer.
 - Ideal for small dictionary streams, test harnesses, or memory-rich host environments.
+
+### 3.3 Resumption Architecture: Verify-Output Mode
+- **Rationale**: Saving mid-stream range-decoder arithmetic state (bit-level fractions, code/range scalars, and ~16 KiB probability models) into disk files introduces extreme I/O overhead and platform divergence. Instead, the engine implements robust, crash-proof **Verify-Output Mode**:
+  1. When `--resume-dir` is specified and a partially written output file exists, the decompressor streams from the beginning of the stream.
+  2. Each decoded 64 KiB block is compared against the corresponding byte slice in the existing output file.
+  3. Disk write I/O is skipped while bytes match.
+  4. Upon the first byte mismatch or when the end of the existing file is reached, the output file is truncated to the verified boundary, and the decompressor switches to standard append mode.
+- **Stream-Boundary Resumption**:
+  - In concatenated multi-stream archives, `--resume-from` is valid when aligned to an exact Stream Header boundary (`\xfd7zXZ\x00`).
 
 ---
 
@@ -164,7 +230,7 @@ class HistoryBackend:
   - Wall-clock: Configures `SIGALRM` via `setitimer(ITIMER_REAL)` or `alarm` on POSIX systems.
   - CPU-time: Configures `SIGVTALRM` via `setitimer(ITIMER_VIRTUAL)` where supported.
   - Platforms without signals (Windows, MicroPython, non-main threads) gracefully bypass signal registration without failure.
-- **Cooperative Clock-Checking ("Slightly Early")**:
+- **Cooperative Clock-Checking ('Slightly Early')**:
   - Enforced on all platforms inside the CLI event loop on every decompressor event.
   - Uses a safety margin of ~150–200 ms:
     `wall_elapsed >= timeout_sec - 0.15`
@@ -174,36 +240,56 @@ class HistoryBackend:
 ### 4.3 Interruption Output & Exit Code
 Upon wall-clock or CPU timeout:
 1. Emits standard resumption message to `sys.stderr`:
-   ```
-   \nDecompression timed out [wall-clock deadline reached / CPU time limit reached].
+   ```text
+   \nDecompression timed out (wall-clock deadline reached / CPU time limit reached).
    To resume, run with: --resume-dir=<dir> [--resume-from=<in_offset>] [--resume-at=<out_offset>]
    ```
 2. Exits with standard status code **124** (`E_DEADLINE`).
 
 ---
 
-## 5. Multi-Stream XZ Handling & Stream Boundary Semantics
+## 5. Multi-Stream XZ Handling, Index & Stream Footer Semantics
 
-- Concatenated XZ streams are permitted to have 0 to any multiple of 4 bytes null padding (`0x00`) per RFC §2.1.2.
+### 5.1 Multi-Stream Concatenation & RFC §2.1.2 Padding
+- Concatenated XZ streams are permitted to have 0 to any multiple of 4 bytes null padding (`0x00`) per RFC §2.1.2. Any non-null byte or null padding sequence whose length is not a multiple of 4 bytes must raise `E_FORMAT`.
 - Stream 0 writes to `<base>`, stream `K >= 1` writes to `<base>_<K><ext>`.
 - Boundary telemetry emitted to `sys.stderr`:
   - Normal files: `[xz:stream boundary] input_offset=...B stream_in=...B stream_out=...B output_offset=...B starting stream <K> -> <target>`
   - Non-files: `[xz:stream boundary] input_offset=...B stream_in=...B stream_out=...B output_offset=...B starting stream <K> -> <target>+<offset>B`
 
+### 5.2 Normative Index Field Verification
+Following all Blocks in a stream, an Index field terminates the payload:
+1. **Index Indicator**: Leading byte `0x00`.
+2. **Number of Records**: Encoded as a VLI. Must equal the exact number of Blocks decoded in this stream.
+3. **Record Validation**: For each record, the VLI pair (`Unpadded Size`, `Uncompressed Size`) must be verified:
+   - `Unpadded Size == Block Header Size + Compressed Size + Check Size`.
+   - `Uncompressed Size == Total Uncompressed Bytes emitted by Block`.
+4. **Index Padding**: 0 to 3 null bytes aligning the Index to a 4-byte boundary.
+5. **Index CRC32**: 4-byte little-endian CRC32 calculated over all Index bytes from the `0x00` indicator through the padding. Decoders must verify this CRC32, raising `E_CHECK` on failure.
+
+### 5.3 Normative Stream Footer Verification
+Every XZ stream concludes with a 12-byte Stream Footer:
+1. **Footer CRC32 (Bytes 0–3)**: Little-endian 32-bit CRC32 calculated over Backward Size (4 bytes) and Stream Flags (2 bytes). Must be computed and verified.
+2. **Backward Size (Bytes 4–7)**: 32-bit unsigned integer encoding the size of the Index:
+   `real_index_size = (backward_size + 1) * 4`
+   Decoders must verify that `real_index_size` equals the actual number of bytes in the Index field.
+3. **Stream Flags (Bytes 8–9)**: Must match the Stream Header Flags identically. Any mismatch indicates stream corruption and must raise `E_FORMAT`.
+4. **Footer Magic (Bytes 10–11)**: Must equal `0x59, 0x5A` (`b"YZ"`).
+
 ---
 
 ## 6. Staging, Filename Resolution & In-Place Directives
 
-- Auto-naming: case-insensitive `<base>.xz`/`<base>.lzma` -> `<base>`, `-` -> `stdin.unxz`, fallback `<name>.unxz`.
-- Staged as `<target>.part`, atomically renamed to `<target>` on stream completion. Unlinks stale `.part` on non-resuming runs.
-- Direct `--in-place` mode writes directly without `.part` intermediaries.
-- Resumption stream-0 invariant: always invoked with base stream-0 filename.
+- **Auto-Naming**: Case-insensitive `<base>.xz` or `<base>.lzma` -> `<base>`, `-` -> `stdin.unxz`, fallback `<name>.unxz`.
+- **Atomic Staging**: Files are decoded to `<target>.part` and atomically renamed to `<target>` upon successful stream completion. Any stale `.part` file from a prior non-resuming run is unlinked prior to output initialization.
+- **Direct `--in-place` Mode**: Writes directly to destination targets without `.part` intermediaries.
+- **Resumption Invariant**: Stream 0 is always invoked with the base filename.
 
 ---
 
 ## 7. Command-Line Interface (CLI)
 
-```
+```text
 usage: xz_decompressor.py [-h] [-o OUTPUT] [--resume-dir RESUME_DIR]
                           [--resume-from RESUME_FROM] [--resume-at RESUME_AT]
                           [--in-place] [--timeout TIMEOUT]
@@ -233,10 +319,28 @@ optional arguments:
 
 ## 8. Verification Suite Specification (`--test`)
 
-Built-in unit tests verifying:
-1. Flexible ISO-8601 parsing across bare dates, compact formats, and variable time precisions.
-2. Duration parser (`<N>s`, `<N>m`, `0`).
-3. Cooperative wall-clock timeout triggering slightly early.
-4. Multi-stream concatenation with 0, 4, 8 null padding bytes.
-5. Presets 0, 1, 6, and 9e (64 MiB dictionary).
-6. DirectoryBlockHistoryStore circular eviction and Verify-Output mode recovery.
+The built-in self-test suite (`--test`) must provide 100% self-contained coverage without external test files:
+1. **Flexible ISO-8601 Parser**: Validating bare dates, compact notation, optional punctuation, and subsecond fractions against known epochs.
+2. **Duration Parser**: Validating `<N>s`, `<N>m`, `0`, and fractional inputs.
+3. **Cooperative Timeout Safety**: Asserting early termination (~150 ms margin) and clean status 124 exit.
+4. **Multi-Stream & RFC Padding**: Testing concatenation with 0, 4, and 8 null bytes, asserting strict multiple-of-4 alignment.
+5. **Block Header & LZMA2 Property Extraction**: Parsing variable dictionary properties and asserting proper buffer sizing.
+6. **Block Check Verification**: Verifying CRC32, CRC64, and SHA-256 integrity checks, and confirming fatal errors upon synthetic byte tampering.
+7. **Index & Stream Footer Verification**: Asserting Backward Size, Index CRC32, and Footer CRC32 cross-checks.
+8. **LZMA2 Chunk Reset Semantics**: Verifying dictionary resets on `mode == 3` and `ctrl == 0x01`.
+9. **DirectoryBlockHistoryStore & Verify-Output Recovery**: Simulating interrupted streams, corrupted partial outputs, circular buffer eviction, and automatic boundary repair.
+
+---
+
+## 9. Standard Error Codes & Exit Status
+
+| Exit Code | Identifier | Description |
+|:---|:---|:---|
+| `0` | `SUCCESS` | Decompression completed successfully; all checksums verified. |
+| `1` | `E_FORMAT` | Invalid stream magic, corrupt header, illegal VLI, or malformed padding. |
+| `1` | `E_UNSUPPORTED` | Unsupported filter count (> 1), non-LZMA2 filter ID, or reserved flags. |
+| `1` | `E_CHECK` | Header CRC32, Block Check (CRC32/CRC64/SHA-256), Index CRC32, or Footer CRC32 mismatch. |
+| `1` | `E_RESOURCE` | Out of memory, insufficient disk space, or history buffer allocation error. |
+| `1` | `E_IO` | File read/write failure, broken pipe, or directory permission error. |
+| `124` | `E_DEADLINE` | Wall-clock timeout, absolute UTC deadline instant, or CPU timeout reached. |
+| `130` | `SIGINT` | Interrupted by user keyboard interrupt (`Ctrl+C`). |
