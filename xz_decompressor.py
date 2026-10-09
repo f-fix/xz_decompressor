@@ -10,9 +10,20 @@ import os
 import struct
 import hashlib
 import json
-import argparse
-import unittest
 from pathlib import Path
+
+# MicroPython native machine code decorator shim
+try:
+    import micropython
+except ImportError:
+    class _MicroPythonShim:
+        @staticmethod
+        def native(fn):
+            return fn
+        @staticmethod
+        def viper(fn):
+            return fn
+    micropython = _MicroPythonShim()
 
 # --- Pure-Python CRC32 (Standard IEEE 802.3 / XZ) ---
 CRC32_TABLE = []
@@ -22,6 +33,7 @@ for _i in range(256):
         _c = (_c >> 1) ^ 0xEDB88320 if (_c & 1) else (_c >> 1)
     CRC32_TABLE.append(_c)
 
+@micropython.native
 def crc32(data, val=0):
     c = val ^ 0xFFFFFFFF
     for b in data:
@@ -37,6 +49,7 @@ for _i in range(256):
         _c = (_c >> 1) ^ _POLY64 if (_c & 1) else (_c >> 1)
     CRC64_TABLE.append(_c)
 
+@micropython.native
 def crc64(data, val=0):
     c = val ^ 0xFFFFFFFFFFFFFFFF
     for b in data:
@@ -206,6 +219,121 @@ class ProgressEvent:
         self.block_index = block_index
         self.bytes_decoded = bytes_decoded
         self.total_emitted = total_emitted
+
+
+# --- Low-Memory, MicroPython & Storage Adaptation Helpers ---
+
+def parse_memory_size(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    val_str = str(val).strip().lower()
+    if val_str.endswith("k") or val_str.endswith("kb") or val_str.endswith("kib"):
+        num_part = val_str.rstrip("kib")
+        return int(float(num_part) * 1024)
+    elif val_str.endswith("m") or val_str.endswith("mb") or val_str.endswith("mib"):
+        num_part = val_str.rstrip("mib")
+        return int(float(num_part) * 1024 * 1024)
+    elif val_str.endswith("g") or val_str.endswith("gb") or val_str.endswith("gib"):
+        num_part = val_str.rstrip("gib")
+        return int(float(num_part) * 1024 * 1024 * 1024)
+    return int(float(val_str))
+
+def get_available_memory():
+    # 1. MicroPython / CircuitPython free heap
+    try:
+        import gc
+        if hasattr(gc, "mem_free"):
+            return gc.mem_free()
+    except Exception:
+        pass
+    # 2. Linux / POSIX sysconf
+    try:
+        pages = os.sysconf("SC_AVPHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        return pages * page_size
+    except Exception:
+        pass
+    # 3. /proc/meminfo
+    try:
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except Exception:
+        pass
+    # Fallback to generous 1 GB if unprobed
+    return 1024 * 1024 * 1024
+
+def find_preferred_storage_dir(prefix="xz_history"):
+    # Priority 1: PSRAM / RAM-disk VFS mount points (highest performance, zero flash wear)
+    psram_candidates = ["/psram", "/ramdisk", "/vfs_ram", "/tmp"]
+    for cand in psram_candidates:
+        p = Path(cand)
+        try:
+            if p.is_dir() and os.access(str(p), os.W_OK):
+                target = p / prefix
+                target.mkdir(parents=True, exist_ok=True)
+                return str(target), "psram"
+        except Exception:
+            pass
+
+    # Priority 2: External flash / SD card / eMMC (MicroPython / CircuitPython default over onboard flash)
+    ext_candidates = ["/sd", "/sdcard", "/emmc", "/external"]
+    for cand in ext_candidates:
+        p = Path(cand)
+        try:
+            if p.is_dir() and os.access(str(p), os.W_OK):
+                target = p / prefix
+                target.mkdir(parents=True, exist_ok=True)
+                return str(target), "external_flash"
+        except Exception:
+            pass
+
+    # Priority 3: Local scratch directory
+    target = Path(f".{prefix}").resolve()
+    target.mkdir(parents=True, exist_ok=True)
+    return str(target), "local"
+
+def select_block_size(block_size_choice="auto", available_mem=None):
+    if block_size_choice not in (None, "auto"):
+        return parse_memory_size(block_size_choice)
+
+    if available_mem is None:
+        available_mem = get_available_memory()
+
+    # On devices with less than 256KB of python-available RAM, default to 8KiB rather than 64KiB
+    if available_mem < 256 * 1024:
+        return 8192
+    return 65536
+
+def select_history_backend(backend_choice="auto", storage_dir=None, available_mem=None, max_history=67108864):
+    if available_mem is None:
+        available_mem = get_available_memory()
+
+    if backend_choice == "memory":
+        return MemoryHistory(max_history=max_history)
+    elif backend_choice == "file":
+        if storage_dir is None:
+            s_dir, _ = find_preferred_storage_dir()
+        else:
+            s_dir = storage_dir
+        return FileHistory(Path(s_dir) / "history.bin", max_history=max_history)
+    elif backend_choice == "directory":
+        if storage_dir is None:
+            s_dir, _ = find_preferred_storage_dir()
+        else:
+            s_dir = storage_dir
+        return DirectoryBlockHistoryStore(s_dir)
+
+    # Automatic selection based on memory threshold:
+    # When python-available memory is less than 72MB (72 * 1024 * 1024 bytes), automatically switch from MemoryHistory to DirectoryBlockHistoryStore or FileHistory
+    if available_mem < 72 * 1024 * 1024:
+        s_dir, stype = find_preferred_storage_dir() if storage_dir is None else (storage_dir, "custom")
+        return DirectoryBlockHistoryStore(s_dir)
+    else:
+        return MemoryHistory(max_history=max_history)
 
 # --- Pluggable History Backends ---
 
@@ -409,6 +537,7 @@ class FileHistory(HistoryBackend):
         self.f = open(self.file_path, "w+b")
         self.total_written = 0
         self.max_history = max_history
+        self.checkpoints = {}
 
     def append_block(self, block_data, block_index=0, input_hash=""):
         self.f.seek(self.total_written)
@@ -417,14 +546,27 @@ class FileHistory(HistoryBackend):
         self.total_written += len(block_data)
 
     def get_history_slice(self, distance, length):
-        if distance > self.total_written:
-            return b""
-        if distance <= 0:
+        if distance > self.total_written or distance <= 0:
             return b""
         start_pos = max(0, self.total_written - distance)
         read_len = min(length, self.total_written - start_pos)
         self.f.seek(start_pos)
         return self.f.read(read_len)
+
+    def checkpoint(self, block_index, state_record, input_hash=""):
+        self.checkpoints[block_index] = dict(state_record)
+
+    def restore(self, block_index):
+        return self.checkpoints.get(block_index)
+
+    def reset(self):
+        try:
+            self.f.seek(0)
+            self.f.truncate(0)
+        except Exception:
+            pass
+        self.total_written = 0
+        self.checkpoints.clear()
 
     def cleanup(self):
         try:
@@ -432,6 +574,21 @@ class FileHistory(HistoryBackend):
             self.file_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+    def export_state(self):
+        return {
+            "file_path": str(self.file_path),
+            "total_written": self.total_written,
+            "max_history": self.max_history
+        }
+
+    def import_state(self, state):
+        self.file_path = Path(state["file_path"])
+        self.total_written = state["total_written"]
+        self.max_history = state["max_history"]
+        if self.f.closed:
+            self.f = open(self.file_path, "r+b")
+        self.f.seek(self.total_written)
 
 # --- Range Decoder ---
 
@@ -446,6 +603,7 @@ class RangeDecoder:
             self.code = 0
             self.range = 0xFFFFFFFF
 
+    @micropython.native
     def decode_bit(self, probs, index):
         prob = probs[index]
         bound = (self.range >> 11) * prob
@@ -464,12 +622,14 @@ class RangeDecoder:
             self.code = ((self.code << 8) | b) & 0xFFFFFFFF
         return bit
 
+    @micropython.native
     def decode_bittree(self, probs, offset, num_bits):
         m = 1
         for _ in range(num_bits):
             m = (m << 1) + self.decode_bit(probs, offset + m)
         return m - (1 << num_bits)
 
+    @micropython.native
     def decode_reverse_bittree(self, probs, offset, num_bits):
         m = 1
         symbol = 0
@@ -479,6 +639,7 @@ class RangeDecoder:
             symbol |= (bit << i)
         return symbol
 
+    @micropython.native
     def decode_direct_bits(self, num_bits):
         val = 0
         for _ in range(num_bits):
@@ -496,6 +657,7 @@ class RangeDecoder:
                 self.code = ((self.code << 8) | b) & 0xFFFFFFFF
         return val
 
+@micropython.native
 def decode_len_val(rd, probs, pos_state):
     if rd.decode_bit(probs, 0) == 0:
         return rd.decode_bittree(probs, 2 + (pos_state << 3), 3)
@@ -506,7 +668,7 @@ def decode_len_val(rd, probs, pos_state):
 # --- Universal XZ / LZMA2 Decompression Engine ---
 
 class XZStreamDecompressor:
-    def __init__(self, input_source, history_backend=None, block_size=65536):
+    def __init__(self, input_source, history_backend=None, block_size=65536, force_gc=True):
         self.input = input_source
         self.history = history_backend or MemoryHistory()
         self.block_size = block_size
@@ -537,6 +699,7 @@ class XZStreamDecompressor:
         self.stream_block_records = []
         self.tot_idx = 0
         self.pending_boundary = None
+        self.force_gc = force_gc
 
         self.PROB_INIT = 1024
         self.state = 0
@@ -988,6 +1151,12 @@ class XZStreamDecompressor:
                                     self.stream_out_offset += len(committed)
                                     self.block_idx += 1
                                     self.cur_block_pos = 0
+                                    if self.force_gc:
+                                        try:
+                                            import gc
+                                            gc.collect()
+                                        except Exception:
+                                            pass
                                     self.rd_code = rd.code
                                     self.rd_range = rd.range
                                     self.comp_offset = c_off
@@ -1231,8 +1400,10 @@ def format_suffixed_filename(base_path, stream_idx):
 
 def decompress_xz(input_source, output_target=None, resume_dir=None,
                   resume_from=None, resume_at=None, in_place=False,
-                  progress_callback=None, history_backend=None,
-                  timeout=52.0, cpu_timeout=22.0, deadline=None):
+                  progress_callback=None, history_backend="auto",
+                  timeout=52.0, cpu_timeout=22.0, deadline=None,
+                  block_size="auto", storage_dir=None, memory_limit=None,
+                  force_gc=True):
     """
     Callable interface for XZ decompression.
     """
@@ -1250,26 +1421,29 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
         if output_target is None:
             output_target = "-"
 
-    if history_backend is not None:
-        history = history_backend
-    elif resume_dir:
-        history = DirectoryBlockHistoryStore(resume_dir)
-    else:
-        history = MemoryHistory()
+    avail_mem = parse_memory_size(memory_limit) if memory_limit is not None else get_available_memory()
+    actual_storage_dir = storage_dir if storage_dir is not None else resume_dir
 
+    if isinstance(history_backend, str):
+        history = select_history_backend(history_backend, storage_dir=actual_storage_dir, available_mem=avail_mem)
+    elif history_backend is not None:
+        history = history_backend
+    else:
+        history = select_history_backend("auto", storage_dir=actual_storage_dir, available_mem=avail_mem)
+
+    actual_block_size = select_block_size(block_size, available_mem=avail_mem)
     is_stream_output = (output_target == "-")
     is_stream_input = (input_source == "-") or not is_seekable(in_stream)
 
     # Verify resume offsets if specified
     if resume_from is not None:
         if isinstance(history, DirectoryBlockHistoryStore):
-            # Verify working directory state matches resume_from
             if not history.state_files:
                 raise RuntimeError(f"Hard resumption error: no state found for --resume-from={resume_from}")
         if is_seekable(in_stream):
             in_stream.seek(resume_from)
 
-    engine = XZStreamDecompressor(in_stream, history)
+    engine = XZStreamDecompressor(in_stream, history, block_size=actual_block_size, force_gc=force_gc)
 
     # Initialize clocks and subtract initial counter readings
     import time, signal, math
@@ -1492,9 +1666,20 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
 
     return engine.overall_output_offset
 
-# --- Built-In Unittest Suite ---
+# --- Built-In Unittest Suite (Lazy Imported for CircuitPython Compatibility) ---
 
-class TestXZDecompressor(unittest.TestCase):
+try:
+    import unittest
+except ImportError:
+    unittest = None
+
+if unittest is not None:
+    _TestCaseBase = unittest.TestCase
+else:
+    class _TestCaseBase:
+        pass
+
+class TestXZDecompressor(_TestCaseBase):
     @classmethod
     def setUpClass(cls):
         import lzma
@@ -1539,7 +1724,7 @@ class TestXZDecompressor(unittest.TestCase):
             self.assertEqual(b"".join(out_slices), part1 + part2)
 
     def test_directory_block_history_and_cleanup(self):
-        tmp_dir = Path("/tmp/turn6/test_hist")
+        tmp_dir = Path("/tmp/test_hist")
         tmp_dir.mkdir(parents=True, exist_ok=True)
         hist = DirectoryBlockHistoryStore(tmp_dir, max_blocks=3)
         b1 = b"A" * 65536
@@ -1561,8 +1746,8 @@ class TestXZDecompressor(unittest.TestCase):
     def test_verify_output_mode(self):
         lzma = self.lzma
         import io
-        work_dir = Path("/tmp/turn6/test_verify_work")
-        out_target = Path("/tmp/turn6/test_verify_out.bin")
+        work_dir = Path("/tmp/test_verify_work")
+        out_target = Path("/tmp/test_verify_out.bin")
         data = b"VERIFY_PAYLOAD_TEST_" * 500
         xz_data = lzma.compress(data)
         
@@ -1809,8 +1994,8 @@ class TestXZDecompressor(unittest.TestCase):
         raw = b"ABCDEFGHIJ" * 20000 # 200,000 bytes spanning 4 blocks
         xz_data = lzma.compress(raw, preset=1)
 
-        work_dir = Path("/tmp/turn13/test_verify_multi_work")
-        out_target = Path("/tmp/turn13/test_verify_multi_out.bin")
+        work_dir = Path("/tmp/test_verify_multi_work")
+        out_target = Path("/tmp/test_verify_multi_out.bin")
         corrupt_raw = raw[:80000] + b"CORRUPTED_BYTES" + raw[80015:150000]
         out_target.write_bytes(corrupt_raw)
 
@@ -1871,26 +2056,202 @@ class TestXZDecompressor(unittest.TestCase):
         self.assertEqual(parse_duration("0"), 0.0)
         self.assertIsNone(parse_duration(None))
 
-def main():
-    parser = argparse.ArgumentParser(description="Universal Pure-Python Resumable XZ / LZMA2 Decompressor")
-    parser.add_argument("input", nargs="?", default="-", help="Path to .xz file or '-' for stdin")
-    parser.add_argument("-o", "--output", default=None, help="Output destination or '-' for stdout")
-    parser.add_argument("--resume-dir", default=None, help="Working directory for circular buffer checkpoints")
-    parser.add_argument("--resume-from", type=int, default=None, help="Input offset for non-seekable resumption")
-    parser.add_argument("--resume-at", type=int, default=None, help="Output offset for non-seekable resumption")
-    parser.add_argument("--in-place", action="store_true", help="Write directly to targets without .part staging")
-    parser.add_argument("--timeout", default="52s", help="Wall-clock timeout [<N>s|<N>m|0] (default: 52s)")
-    parser.add_argument("--cpu-timeout", default="22s", help="CPU timeout [<N>s|<N>m|0] (default: 22s)")
-    parser.add_argument("--deadline", default=None, help="Absolute UTC deadline instant (ISO-8601)")
-    parser.add_argument("--test", action="store_true", help="Run self-contained unit test suite")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Diagnostic logging")
-    args = parser.parse_args()
 
-    if args.test:
-        suite = unittest.TestLoader().loadTestsFromTestCase(TestXZDecompressor)
-        runner = unittest.TextTestRunner(verbosity=2)
-        result = runner.run(suite)
-        sys.exit(0 if result.wasSuccessful() else 1)
+    def test_storage_memory_history(self):
+        hist = MemoryHistory(max_history=1024)
+        hist.append_block(b"BLOCK_A_" * 16, 0)
+        hist.append_block(b"BLOCK_B_" * 16, 1)
+        # Test forward slice
+        sl = hist.get_history_slice(16, 8)
+        self.assertEqual(len(sl), 8)
+        # Test export/import
+        st = hist.export_state()
+        hist2 = MemoryHistory(max_history=1024)
+        hist2.import_state(st)
+        self.assertEqual(hist2.get_history_slice(16, 8), sl)
+        hist.cleanup()
+
+    def test_storage_directory_history(self):
+        work_dir = Path("/tmp/test_dir_store")
+        work_dir.mkdir(parents=True, exist_ok=True)
+        hist = DirectoryBlockHistoryStore(work_dir, max_blocks=3)
+        hist.append_block(b"ALPHA_" * 10, 0)
+        hist.append_block(b"BETA__" * 10, 1)
+        hist.checkpoint(1, {"step": 1})
+        self.assertEqual(hist.restore(1), {"step": 1})
+        sl = hist.get_history_slice(12, 6)
+        self.assertEqual(len(sl), 6)
+        hist.cleanup()
+        self.assertFalse(work_dir.exists())
+
+    def test_storage_file_history(self):
+        fpath = Path("/tmp/test_file_store.bin")
+        hist = FileHistory(fpath, max_history=1024)
+        hist.append_block(b"FILE_BLOCK_1_" * 8, 0)
+        hist.append_block(b"FILE_BLOCK_2_" * 8, 1)
+        sl = hist.get_history_slice(14, 7)
+        self.assertEqual(len(sl), 7)
+        hist.checkpoint(1, {"idx": 1})
+        self.assertEqual(hist.restore(1), {"idx": 1})
+        st = hist.export_state()
+        self.assertIn("total_written", st)
+        hist.cleanup()
+        self.assertFalse(fpath.exists())
+
+    def test_storage_auto_selection_memory_threshold(self):
+        # When python-available memory is less than 72MB, switch from MemoryHistory to disk/file
+        low_mem = 64 * 1024 * 1024 # 64MB (< 72MB)
+        high_mem = 128 * 1024 * 1024 # 128MB (>= 72MB)
+
+        backend_low = select_history_backend("auto", available_mem=low_mem)
+        self.assertIsInstance(backend_low, DirectoryBlockHistoryStore)
+        backend_low.cleanup()
+
+        backend_high = select_history_backend("auto", available_mem=high_mem)
+        self.assertIsInstance(backend_high, MemoryHistory)
+        backend_high.cleanup()
+
+        # Explicit overrides
+        backend_forced_mem = select_history_backend("memory", available_mem=low_mem)
+        self.assertIsInstance(backend_forced_mem, MemoryHistory)
+
+        f_tmp = Path("/tmp/test_f_ovr")
+        backend_forced_file = select_history_backend("file", storage_dir=str(f_tmp), available_mem=high_mem)
+        self.assertIsInstance(backend_forced_file, FileHistory)
+        backend_forced_file.cleanup()
+
+    def test_storage_auto_block_size_threshold(self):
+        # On devices with less than 256KB of RAM, default to 8KiB rather than 64KiB
+        tiny_mem = 128 * 1024 # 128KB (< 256KB)
+        norm_mem = 10 * 1024 * 1024 # 10MB (>= 256KB)
+
+        self.assertEqual(select_block_size("auto", available_mem=tiny_mem), 8192)
+        self.assertEqual(select_block_size("auto", available_mem=norm_mem), 65536)
+
+        # Explicit overrides
+        self.assertEqual(select_block_size(16384), 16384)
+        self.assertEqual(select_block_size("8k"), 8192)
+        self.assertEqual(select_block_size("64k"), 65536)
+
+    def test_psram_and_external_storage_detection(self):
+        # Test path selection
+        target_dir, stype = find_preferred_storage_dir(prefix="test_pref_vfs")
+        self.assertTrue(Path(target_dir).exists())
+        self.assertIn(stype, ("psram", "external_flash", "local"))
+
+    def test_micropython_decorators_and_gc(self):
+        # Verify decorated functions work identically
+        self.assertEqual(crc32(b"123456789"), 0xCBF43926)
+        self.assertEqual(crc64(b"123456789"), 0x995DC9BBDF1939FA)
+
+        # Test decompress with force_gc=True and force_gc=False
+        lzma = self.lzma
+        import io
+        data = b"GC_TEST_PAYLOAD_" * 100
+        xz_data = lzma.compress(data)
+
+        # Force GC enabled
+        eng1 = XZStreamDecompressor(io.BytesIO(xz_data), force_gc=True)
+        out1 = b"".join(ev.data for ev in eng1.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+        self.assertEqual(out1, data)
+
+        # Force GC disabled
+        eng2 = XZStreamDecompressor(io.BytesIO(xz_data), force_gc=False)
+        out2 = b"".join(ev.data for ev in eng2.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+        self.assertEqual(out2, data)
+
+    def test_circuitpython_import_handling(self):
+        # Test memory size parser
+        self.assertEqual(parse_memory_size("64m"), 64 * 1024 * 1024)
+        self.assertEqual(parse_memory_size("128k"), 128 * 1024)
+        self.assertEqual(parse_memory_size("1g"), 1024 * 1024 * 1024)
+        self.assertEqual(parse_memory_size(262144), 262144)
+        self.assertIsNone(parse_memory_size(None))
+
+def main():
+    try:
+        import argparse
+    except ImportError:
+        argparse = None
+
+    try:
+        import unittest
+    except ImportError:
+        unittest = None
+
+    if argparse is not None:
+        parser = argparse.ArgumentParser(description="Universal Pure-Python Resumable XZ / LZMA2 Decompressor")
+        parser.add_argument("input", nargs="?", default="-", help="Path to .xz file or '-' for stdin")
+        parser.add_argument("-o", "--output", default=None, help="Output destination or '-' for stdout")
+        parser.add_argument("--resume-dir", default=None, help="Working directory for circular buffer checkpoints")
+        parser.add_argument("--resume-from", type=int, default=None, help="Input offset for non-seekable resumption")
+        parser.add_argument("--resume-at", type=int, default=None, help="Output offset for non-seekable resumption")
+        parser.add_argument("--in-place", action="store_true", help="Write directly to targets without .part staging")
+        parser.add_argument("--timeout", default="52s", help="Wall-clock timeout [<N>s|<N>m|0] (default: 52s)")
+        parser.add_argument("--cpu-timeout", default="22s", help="CPU timeout [<N>s|<N>m|0] (default: 22s)")
+        parser.add_argument("--deadline", default=None, help="Absolute UTC deadline instant (ISO-8601)")
+        parser.add_argument("--history-backend", choices=["auto", "memory", "directory", "file"], default="auto",
+                            help="Storage backend: auto (<72MB switches to disk), memory, directory, file")
+        parser.add_argument("--block-size", default="auto",
+                            help="Block size: auto (8KiB if <256KB RAM, else 64KiB), or integer/size string")
+        parser.add_argument("--storage-dir", default=None,
+                            help="Directory for history/scratch files (overrides PSRAM/SD detection)")
+        parser.add_argument("--memory-limit", default=None,
+                            help="Simulate/override python-available RAM limit (e.g. 64m, 128k)")
+        parser.add_argument("--no-gc", dest="force_gc", action="store_false", default=True,
+                            help="Disable forced gc.collect() in between blocks")
+        parser.add_argument("-v", "--verbose", action="store_true", help="Diagnostic logging")
+
+        if unittest is not None:
+            parser.add_argument("--test", action="store_true", help="Run self-contained unit test suite")
+
+        args = parser.parse_args()
+
+        if hasattr(args, "test") and args.test:
+            if unittest is None:
+                sys.stderr.write("--test disabled: unittest is not available in this environment\n")
+                sys.exit(1)
+            suite = unittest.TestLoader().loadTestsFromTestCase(TestXZDecompressor)
+            runner = unittest.TextTestRunner(verbosity=2)
+            result = runner.run(suite)
+            sys.exit(0 if result.wasSuccessful() else 1)
+        elif "--test" in sys.argv and unittest is None:
+            sys.stderr.write("--test disabled: unittest is not available in this environment\n")
+            sys.exit(1)
+
+        input_src = args.input
+        output_dst = args.output
+        res_dir = args.resume_dir
+        res_from = args.resume_from
+        res_at = args.resume_at
+        inp = args.in_place
+        t_out = args.timeout
+        c_out = args.cpu_timeout
+        d_line = args.deadline
+        h_backend = args.history_backend
+        b_size = args.block_size
+        s_dir = args.storage_dir
+        m_limit = args.memory_limit
+        f_gc = args.force_gc
+    else:
+        # Fallback minimal argument parser for CircuitPython without argparse
+        if "--test" in sys.argv:
+            sys.stderr.write("--test disabled: unittest / argparse is not available in this environment\n")
+            sys.exit(1)
+        input_src = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else "-"
+        output_dst = None
+        res_dir = None
+        res_from = None
+        res_at = None
+        inp = False
+        t_out = "52s"
+        c_out = "22s"
+        d_line = None
+        h_backend = "auto"
+        b_size = "auto"
+        s_dir = None
+        m_limit = None
+        f_gc = True
 
     spinner = ("\\", "|", "/", "-")
     spin_idx = [0]
@@ -1902,16 +2263,21 @@ def main():
 
     try:
         decompress_xz(
-            input_source=args.input,
-            output_target=args.output,
-            resume_dir=args.resume_dir,
-            resume_from=args.resume_from,
-            resume_at=args.resume_at,
-            in_place=args.in_place,
+            input_source=input_src,
+            output_target=output_dst,
+            resume_dir=res_dir,
+            resume_from=res_from,
+            resume_at=res_at,
+            in_place=inp,
             progress_callback=progress_cb,
-            timeout=args.timeout,
-            cpu_timeout=args.cpu_timeout,
-            deadline=args.deadline
+            history_backend=h_backend,
+            timeout=t_out,
+            cpu_timeout=c_out,
+            deadline=d_line,
+            block_size=b_size,
+            storage_dir=s_dir,
+            memory_limit=m_limit,
+            force_gc=f_gc
         )
     except (WallClockTimeout, CPUTimeout):
         sys.exit(124)

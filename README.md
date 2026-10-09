@@ -3,7 +3,7 @@ Pure-Python XZ / LZMA2 Streaming Decompressor with Resumption
 
 Target Environments: MicroPython, PyPy 3, CPython 3.8+  
 Authoritative Standard: The .xz File Format Specification (v1.2.0 / RFC §2 & §3)  
-Revision: 5 (Comprehensive Container Validation, Filter Framing, and Resumption Engine)
+Revision: 6 (Low-Memory Adaptations, MicroPython / CircuitPython, PSRAM VFS, and CLI Overrides)
 
 ---
 
@@ -200,6 +200,29 @@ class HistoryBackend:
 
 ---
 
+### 3.4 Low-Memory, MicroPython & CircuitPython Adaptation Matrix
+1. **Dynamic History Backend Selection (72 MB Threshold)**:
+   - When python-available memory is less than 72 MiB (`< 75,497,472` bytes), the engine automatically switches from in-memory ring buffering (`MemoryHistory`) to disk/scratch-backed stores (`DirectoryBlockHistoryStore` or `FileHistory`).
+   - Callers can override auto-selection via `--history-backend=[auto|memory|directory|file]`.
+2. **PSRAM VFS & External Storage Prioritization**:
+   - To reduce onboard flash wear and optimize I/O performance on MicroPython/CircuitPython, the engine probes candidate mount points in prioritized order:
+     1. **PSRAM / RAM-Disk VFS**: `/psram`, `/ramdisk`, `/vfs_ram`, `/tmp` (zero flash wear, maximum throughput).
+     2. **External Flash**: `/sd`, `/sdcard`, `/emmc`, `/external` (preferred over onboard SPI flash).
+     3. **Local Scratch Directory**: fallback directory.
+   - Callers can explicitly force a directory path via `--storage-dir=<path>`.
+3. **Small Working Block Buffer (256 KB RAM Threshold)**:
+   - On embedded MCUs with less than 256 KiB of available Python RAM (e.g. RP2040, STM32), the active working block buffer defaults to **8 KiB** rather than 64 KiB, reducing heap footprints.
+   - Callers can override block size via `--block-size=[<N>|<N>k|<N>m]`.
+4. **Inter-Block Garbage Collection**:
+   - To prevent memory fragmentation on constrained heaps, `gc.collect()` is invoked between committed blocks by default.
+   - Callers can disable this via `--no-gc`.
+5. **MicroPython Machine Code Decorators**:
+   - Core computational hotspots (`crc32`, `crc64`, `decode_bit`, `decode_bittree`, `decode_reverse_bittree`, `decode_direct_bits`, `decode_len_val`) use `@micropython.native` machine code decorators. A shim fallback is provided to guarantee 100% transparent execution on CPython and PyPy.
+6. **CircuitPython Compatibility**:
+   - `argparse` and `unittest` are lazy-imported at the point of use with `ImportError` handling. If `unittest` cannot be imported but `argparse` can, `--test` is disabled cleanly with diagnostic notification.
+
+---
+
 ## 4. Timeout, Deadline & Watchdog Specifications
 
 ### 4.1 CLI Flags & Parameters
@@ -294,6 +317,11 @@ usage: xz_decompressor.py [-h] [-o OUTPUT] [--resume-dir RESUME_DIR]
                           [--resume-from RESUME_FROM] [--resume-at RESUME_AT]
                           [--in-place] [--timeout TIMEOUT]
                           [--cpu-timeout CPU_TIMEOUT] [--deadline DEADLINE]
+                          [--history-backend {auto,memory,directory,file}]
+                          [--block-size BLOCK_SIZE]
+                          [--storage-dir STORAGE_DIR]
+                          [--memory-limit MEMORY_LIMIT]
+                          [--no-gc]
                           [--test] [-v] [INPUT]
 
 Universal Pure-Python Resumable XZ / LZMA2 Streaming Decompressor
