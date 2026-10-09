@@ -740,6 +740,7 @@ class XZStreamDecompressor:
                     if b == b"\xfd":
                         if self.null_count % 4 != 0:
                             raise XZFormatError("Stream padding not multiple of 4")
+                        self.null_count = 0
                         magic = bytearray([0xFD]) + self._read_exact(5)
                         if bytes(magic) != b"\xfd7zXZ\x00":
                             raise XZFormatError("Invalid magic")
@@ -1344,7 +1345,7 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                 if (cpu_now - init_cpu) >= (cpu_timeout_sec - coop_margin):
                     raise CPUTimeout("CPU timeout reached (cooperative check)")
             if event.type == XZEventType.CHUNK_OUTPUT:
-                if not is_stream_output and curr_out_stream is None:
+                if not is_stream_output and curr_out_stream is None and verify_file_handle is None:
                     base_dest = format_suffixed_filename(output_target, stream_idx)
                     curr_dest_path = Path(base_dest)
 
@@ -1411,12 +1412,13 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
 
             elif event.type == XZEventType.STREAM_BOUNDARY:
                 if not is_stream_output:
-                    if verify_file_handle is not None:
-                        verify_file_handle.close()
-                        verify_file_handle = None
                     if curr_out_stream is not None:
                         curr_out_stream.close()
                         curr_out_stream = None
+                        verify_file_handle = None
+                    elif verify_file_handle is not None:
+                        verify_file_handle.close()
+                        verify_file_handle = None
 
                     if not in_place and curr_part_path and curr_part_path.exists():
                         if curr_dest_path.exists():
@@ -1438,10 +1440,13 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                 stream_idx = next_stream
 
         if not is_stream_output:
-            if verify_file_handle is not None:
-                verify_file_handle.close()
             if curr_out_stream is not None:
                 curr_out_stream.close()
+                curr_out_stream = None
+                verify_file_handle = None
+            elif verify_file_handle is not None:
+                verify_file_handle.close()
+                verify_file_handle = None
             if not in_place and curr_part_path and curr_part_path.exists():
                 if curr_dest_path.exists():
                     curr_dest_path.unlink()
@@ -1796,6 +1801,75 @@ class TestXZDecompressor(unittest.TestCase):
         with self.assertRaises(XZFormatError):
             engine = XZStreamDecompressor(io.BytesIO(bytes(xz_bad_bs)))
             list(engine.decode_events())
+
+
+    def test_verify_output_mode_multiblock_mismatch(self):
+        lzma = self.lzma
+        import io
+        raw = b"ABCDEFGHIJ" * 20000 # 200,000 bytes spanning 4 blocks
+        xz_data = lzma.compress(raw, preset=1)
+
+        work_dir = Path("/tmp/turn13/test_verify_multi_work")
+        out_target = Path("/tmp/turn13/test_verify_multi_out.bin")
+        corrupt_raw = raw[:80000] + b"CORRUPTED_BYTES" + raw[80015:150000]
+        out_target.write_bytes(corrupt_raw)
+
+        decompress_xz(io.BytesIO(xz_data), str(out_target), resume_dir=str(work_dir), in_place=True)
+        self.assertEqual(out_target.read_bytes(), raw)
+        out_target.unlink(missing_ok=True)
+
+    def test_proves_right_claim1_distance_indexing(self):
+        lzma = self.lzma
+        import random, io
+        prng = random.Random(42)
+        raw = bytearray()
+        for _ in range(100):
+            raw.extend(prng.randbytes(500))
+            raw.extend(b"REPEAT_MATCH_DIST_INVARIANT_" * 20)
+        raw = bytes(raw)
+        xz_data = lzma.compress(raw, preset=9 | lzma.PRESET_EXTREME)
+
+        engine = XZStreamDecompressor(io.BytesIO(xz_data))
+        out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+        self.assertEqual(out, raw)
+
+    def test_proves_right_claim3_stream_padding_isolation(self):
+        lzma = self.lzma
+        import io
+        data1 = b"STREAM_ONE_" * 50
+        data2 = b"STREAM_TWO_" * 50
+        xz1 = lzma.compress(data1)
+        xz2 = lzma.compress(data2)
+
+        # 4 null bytes: valid multiple of 4
+        valid_stream = xz1 + (b"\x00" * 4) + xz2
+        engine_valid = XZStreamDecompressor(io.BytesIO(valid_stream))
+        out_valid = b"".join(ev.data for ev in engine_valid.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+        self.assertEqual(out_valid, data1 + data2)
+
+        # 2 null bytes: invalid multiple of 4
+        invalid_stream = xz1 + (b"\x00" * 2) + xz2
+        engine_invalid = XZStreamDecompressor(io.BytesIO(invalid_stream))
+        with self.assertRaises(XZFormatError):
+            list(engine_invalid.decode_events())
+
+    def test_proves_right_claim5_compact_iso8601(self):
+        # Proves that compact date notations without separators parse accurately
+        ts1 = parse_iso8601_flexible("20261008123045")
+        ts2 = parse_iso8601_flexible("20261008123045.500")
+        self.assertEqual(ts1, 1791462645.0)
+        self.assertEqual(ts2, 1791462645.5)
+
+    def test_proves_right_claim6_duration_types(self):
+        # Proves that ints, floats, and strings all parse correctly
+        self.assertEqual(parse_duration(52), 52.0)
+        self.assertEqual(parse_duration(52.0), 52.0)
+        self.assertEqual(parse_duration("52"), 52.0)
+        self.assertEqual(parse_duration("52s"), 52.0)
+        self.assertEqual(parse_duration("1.5m"), 90.0)
+        self.assertEqual(parse_duration(0), 0.0)
+        self.assertEqual(parse_duration("0"), 0.0)
+        self.assertIsNone(parse_duration(None))
 
 def main():
     parser = argparse.ArgumentParser(description="Universal Pure-Python Resumable XZ / LZMA2 Decompressor")
