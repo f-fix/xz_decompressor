@@ -1,6 +1,9 @@
+#!/usr/bin/env python3
 """
-Pure-Python XZ / LZMA2 Streaming Decompression Engine.
+xz_decompressor - Pure-Python XZ / LZMA2 Streaming Decompression Engine.
+
 Zero required external dependencies, apart from --test mode.
+
 Normal operation compatible with MicroPython, PyPy, and CPython.
 """
 
