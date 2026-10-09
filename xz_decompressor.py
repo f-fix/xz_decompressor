@@ -9,8 +9,66 @@ import os
 import struct
 import hashlib
 import json
-from pathlib import Path
 import io
+try:
+    from pathlib import Path
+except ImportError:
+    class _PathFallback:
+        def __init__(self, p):
+            self._p = str(p)
+        def __str__(self): return self._p
+        def __fspath__(self): return self._p
+        @property
+        def parent(self): return _PathFallback(os.path.dirname(self._p) or ".")
+        @property
+        def name(self): return os.path.basename(self._p)
+        @property
+        def stem(self):
+            n = self.name
+            return n.rsplit(".", 1)[0] if "." in n else n
+        @property
+        def suffix(self):
+            n = self.name
+            return ("." + n.rsplit(".", 1)[1]) if "." in n else ""
+        def resolve(self): return _PathFallback(os.path.abspath(self._p))
+        def exists(self): return os.path.exists(self._p)
+        def is_dir(self): return os.path.isdir(self._p)
+        def is_file(self): return os.path.isfile(self._p)
+        def mkdir(self, parents=False, exist_ok=False):
+            try:
+                os.makedirs(self._p)
+            except OSError:
+                if not exist_ok: raise
+        def unlink(self, missing_ok=False):
+            try:
+                os.remove(self._p)
+            except OSError:
+                if not missing_ok: raise
+        def rmdir(self):
+            try: os.rmdir(self._p)
+            except OSError: pass
+        def read_bytes(self):
+            with open(self._p, "rb") as f: return f.read()
+        def write_bytes(self, b):
+            with open(self._p, "wb") as f: return f.write(b)
+        def read_text(self, encoding="utf-8"):
+            with open(self._p, "r", encoding=encoding) as f: return f.read()
+        def write_text(self, s, encoding="utf-8"):
+            with open(self._p, "w", encoding=encoding) as f: return f.write(s)
+        def stat(self): return os.stat(self._p)
+        def glob(self, pat):
+            import fnmatch
+            res = []
+            try:
+                for fn in os.listdir(self._p):
+                    if fnmatch.fnmatch(fn, pat):
+                        res.append(_PathFallback(os.path.join(self._p, fn)))
+            except OSError:
+                pass
+            return res
+        def __truediv__(self, other):
+            return _PathFallback(os.path.join(self._p, str(other)))
+    Path = _PathFallback
 
 # MicroPython native machine code decorator shim
 try:
@@ -91,6 +149,9 @@ class XZUnsupportedError(ValueError):
     pass
 
 class XZCheckError(ValueError):
+    pass
+
+class XZResourceError(RuntimeError):
     pass
 
 class WallClockTimeout(Exception):
@@ -355,6 +416,8 @@ class HistoryBackend:
         pass
 
 class MemoryHistory(HistoryBackend):
+    persistent = False
+
     def __init__(self, max_history=67108864):
         self.max_history = max_history
         self.history = bytearray()
@@ -365,16 +428,25 @@ class MemoryHistory(HistoryBackend):
         if len(self.history) > self.max_history * 2:
             del self.history[:len(self.history) - self.max_history]
 
+    def history_len(self):
+        return min(len(self.history), self.max_history)
+
     def get_history_slice(self, distance, length):
-        if distance <= 0:
-            return b""
+        h_len = self.history_len()
+        if distance <= 0 or distance > h_len or length <= 0 or length > distance:
+            raise XZFormatError(f"Invalid history reference: distance={distance}, length={length}, available={h_len}")
         start_idx = len(self.history) - distance
-        if start_idx < 0:
-            start_idx = 0
-        end_idx = min(len(self.history), start_idx + length)
-        if start_idx >= end_idx:
-            return b""
+        end_idx = start_idx + length
         return bytes(self.history[start_idx:end_idx])
+
+    def tail_crc32(self, n=65536):
+        avail = min(n, len(self.history))
+        if avail <= 0: return 0
+        return crc32(bytes(self.history[-avail:]))
+
+    def truncate_to(self, history_total):
+        if len(self.history) > history_total:
+            del self.history[history_total:]
 
     def export_state(self):
         return {"max_history": self.max_history, "history": bytes(self.history).hex()}
@@ -391,6 +463,8 @@ class MemoryHistory(HistoryBackend):
 
     def reset(self):
         self.history = bytearray()
+        self.checkpoints.clear()
+
     def cleanup(self):
         self.history = bytearray()
         self.checkpoints.clear()
@@ -452,7 +526,9 @@ class DirectoryBlockHistoryStore(HistoryBackend):
             page_name = f"{input_hash}_{page_idx:08d}.page"
             page_path = self.work_dir / page_name
 
-            with open(page_path, "a+b") as f:
+            if not page_path.exists():
+                page_path.write_bytes(b"")
+            with open(str(page_path), "r+b") as f:
                 f.seek(page_off)
                 f.write(chunk)
                 f.flush()
@@ -478,8 +554,9 @@ class DirectoryBlockHistoryStore(HistoryBackend):
                 self.evict_prior(page_idx - self.max_pages + 1)
 
     def get_history_slice(self, distance: int, length: int) -> bytes:
-        if distance <= 0 or distance > self.total_history_written or length <= 0:
-            return b""
+        h_len = self.history_len()
+        if distance <= 0 or distance > h_len or length <= 0 or length > distance:
+            raise XZFormatError(f"Invalid history reference: distance={distance}, length={length}, available={h_len}")
         abs_start = self.total_history_written - distance
         res = bytearray()
         curr_abs = abs_start
@@ -566,6 +643,10 @@ class DirectoryBlockHistoryStore(HistoryBackend):
             self.lru_cache.pop(idx, None)
 
     def reset(self) -> None:
+        for p in list(self.page_files.values()):
+            try: p.unlink(missing_ok=True)
+            except OSError: pass
+        self.page_files.clear()
         self.lru_cache.clear()
         self.lru_order.clear()
         self.total_history_written = 0
@@ -580,10 +661,12 @@ class DirectoryBlockHistoryStore(HistoryBackend):
         except Exception: pass
 
 class FileHistory(HistoryBackend):
+    persistent = True
+
     def __init__(self, file_path, max_history=67108864):
         self.file_path = Path(file_path).resolve()
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
-        self.f = open(self.file_path, "w+b")
+        self.f = open(str(self.file_path), "w+b")
         self.total_written = 0
         self.max_history = max_history
         self.checkpoints = {}
@@ -594,13 +677,28 @@ class FileHistory(HistoryBackend):
         self.f.flush()
         self.total_written += len(block_data)
 
+    def history_len(self):
+        return min(self.total_written, self.max_history)
+
     def get_history_slice(self, distance, length):
-        if distance > self.total_written or distance <= 0:
-            return b""
+        h_len = self.history_len()
+        if distance <= 0 or distance > h_len or length <= 0 or length > distance:
+            raise XZFormatError(f"Invalid history reference: distance={distance}, length={length}, available={h_len}")
         start_pos = max(0, self.total_written - distance)
         read_len = min(length, self.total_written - start_pos)
         self.f.seek(start_pos)
         return self.f.read(read_len)
+
+    def tail_crc32(self, n=65536):
+        avail = min(n, self.history_len())
+        if avail <= 0: return 0
+        data = self.get_history_slice(avail, avail)
+        return crc32(data)
+
+    def truncate_to(self, history_total):
+        self.total_written = history_total
+        self.f.seek(history_total)
+        self.f.truncate()
 
     def checkpoint(self, block_index, state_record, input_hash=""):
         self.checkpoints[block_index] = dict(state_record)
@@ -636,7 +734,7 @@ class FileHistory(HistoryBackend):
         self.total_written = state["total_written"]
         self.max_history = state["max_history"]
         if self.f.closed:
-            self.f = open(self.file_path, "r+b")
+            self.f = open(str(self.file_path), "r+b")
         self.f.seek(self.total_written)
 
 # --- Range Decoder ---
@@ -750,6 +848,8 @@ class XZStreamDecompressor:
         self.pending_boundary = None
         self._peeked_byte = None
         self.force_gc = force_gc
+        self.need_dict_reset = True
+        self.need_props = True
 
         self.PROB_INIT = 1024
         self.state = 0
@@ -867,6 +967,8 @@ class XZStreamDecompressor:
             "rd_code": self.rd_code,
             "rd_range": self.rd_range,
             "in_match_copy": self.in_match_copy,
+            "need_dict_reset": self.need_dict_reset,
+            "need_props": self.need_props,
             "match_dist": self.match_dist,
             "match_rem": self.match_rem,
             "input_offset": self.overall_input_offset,
@@ -928,6 +1030,8 @@ class XZStreamDecompressor:
         self.rd_code = s["rd_code"]
         self.rd_range = s["rd_range"]
         self.in_match_copy = s["in_match_copy"]
+        self.need_dict_reset = s.get("need_dict_reset", True)
+        self.need_props = s.get("need_props", True)
         self.match_dist = s["match_dist"]
         self.match_rem = s["match_rem"]
         if hasattr(self.input, "seek") and "input_offset" in s and is_seekable(self.input):
@@ -1017,9 +1121,13 @@ class XZStreamDecompressor:
                 if psz != 1:
                     raise XZFormatError("Invalid prop size")
                 pbyte = full_bh[off]; off += 1
-                dict_bits = pbyte & 0x3F
-                if dict_bits > 40:
-                    raise XZFormatError("Invalid dict bits")
+                if pbyte > 40:
+                    raise XZFormatError(f"Reserved LZMA2 dictionary property: {pbyte} > 40")
+                if pbyte == 40:
+                    dict_size = 0xFFFFFFFF
+                else:
+                    dict_size = (2 | (pbyte & 1)) << (pbyte // 2 + 11)
+                self.dict_size = dict_size
                 while off < len(full_bh) - 4:
                     if full_bh[off] != 0:
                         raise XZFormatError("Non-zero header padding")
@@ -1031,6 +1139,8 @@ class XZStreamDecompressor:
                 self.block_uncomp_bytes = 0
                 self.compressed_bytes_in_block = 0
                 self.in_chunk = False
+                self.need_dict_reset = True
+                self.need_props = True
                 self.phase = "CHUNKS"
 
             if self.phase == "CHUNKS":
@@ -1042,9 +1152,13 @@ class XZStreamDecompressor:
                             self.phase = "BLOCK_END"
                             break
                         elif self.ctrl in (1, 2):
+                            if self.need_dict_reset and self.ctrl != 1:
+                                raise XZFormatError("First chunk in Block must reset dictionary (ctrl=0x02 not allowed)")
                             if self.ctrl == 1:
                                 self.history.reset()
                                 self.reps = [0, 0, 0, 0]
+                                self.need_dict_reset = False
+                                self.need_props = True
                             sz_b = self._read_exact(2)
                             self.compressed_bytes_in_block += 2
                             csz = ((sz_b[0] << 8) | sz_b[1]) + 1
@@ -1052,8 +1166,12 @@ class XZStreamDecompressor:
                             self.compressed_bytes_in_block += csz
                             self.raw_pos = 0
                             self.in_chunk = True
-                        elif self.ctrl >= 0x80:
+                        elif self.ctrl < 0x80:
+                            raise XZFormatError(f"Reserved LZMA2 control byte: 0x{self.ctrl:02x}")
+                        else:
                             self.mode = (self.ctrl >> 5) & 3
+                            if self.need_dict_reset and self.mode != 3:
+                                raise XZFormatError(f"First LZMA chunk in Block must reset dictionary (mode={self.mode} != 3)")
                             uh = (self.ctrl & 0x1F) << 16
                             s12 = self._read_exact(2)
                             s34 = self._read_exact(2)
@@ -1066,16 +1184,26 @@ class XZStreamDecompressor:
                             if self.mode >= 2:
                                 pbyte = self._read_exact(1)[0]
                                 self.compressed_bytes_in_block += 1
+                                if pbyte > 224:
+                                    raise XZFormatError(f"Invalid LZMA2 property byte {pbyte} > 224")
                                 self.pb = pbyte // 45
                                 rem = pbyte % 45
                                 self.lp = rem // 9
                                 self.lc = rem % 9
+                                if self.lc + self.lp > 4:
+                                    raise XZFormatError(f"lc + lp = {self.lc + self.lp} > 4 in LZMA2")
                                 self.p_lit = [self.PROB_INIT] * (0x300 << (self.lc + self.lp))
+                                self.need_props = False
+                            elif self.need_props:
+                                raise XZFormatError("LZMA chunk requires properties before use")
                             if self.mode == 3:
                                 self.history.reset()
                                 self.reps = [0, 0, 0, 0]
+                                self.need_dict_reset = False
                             self.chunk_compressed = self._read_exact(self.chunk_comp_sz)
                             self.compressed_bytes_in_block += self.chunk_comp_sz
+                            if len(self.chunk_compressed) > 0 and self.chunk_compressed[0] != 0:
+                                raise XZFormatError(f"First byte of range decoder in chunk must be 0x00, got 0x{self.chunk_compressed[0]:02x}")
                             c_off = 0
                             def _get_b():
                                 nonlocal c_off
@@ -1172,9 +1300,11 @@ class XZStreamDecompressor:
                             if rd.decode_bit(self.p_is_match, match_idx) == 0:
                                 if self.cur_block_pos > 0:
                                     prev_b = self.cur_block[self.cur_block_pos - 1]
-                                else:
+                                elif self.history.history_len() > 0:
                                     ps = self.history.get_history_slice(1, 1)
                                     prev_b = ps[0] if ps else 0
+                                else:
+                                    prev_b = 0
                                 lit_st = (((self.stream_out_offset + self.cur_block_pos) & lp_mask) << self.lc) + (prev_b >> (8 - self.lc))
                                 lit_off = lit_st * 0x300
                                 symbol = 1
@@ -1183,8 +1313,12 @@ class XZStreamDecompressor:
                                     if dist < self.cur_block_pos:
                                         mb = self.cur_block[self.cur_block_pos - 1 - dist]
                                     else:
-                                        ms = self.history.get_history_slice(dist - self.cur_block_pos + 1, 1)
-                                        mb = ms[0] if ms else 0
+                                        h_req_dist = dist - self.cur_block_pos + 1
+                                        if h_req_dist <= self.history.history_len():
+                                            ms = self.history.get_history_slice(h_req_dist, 1)
+                                            mb = ms[0] if ms else 0
+                                        else:
+                                            mb = 0
                                     while symbol < 0x100:
                                         mbit = (mb >> 7) & 1
                                         mb = (mb << 1) & 0xFF
@@ -1283,6 +1417,12 @@ class XZStreamDecompressor:
                                             dist = base + db + ab
                                     self.reps[0] = dist
 
+                                if dist == 0xFFFFFFFF:
+                                    raise XZFormatError("Invalid distance 0xFFFFFFFF in LZMA2")
+                                if hasattr(self, "dict_size") and dist >= self.dict_size:
+                                    raise XZFormatError(f"Distance {dist} exceeds dictionary size {self.dict_size}")
+                                if dist >= self.cur_block_pos + self.history.history_len():
+                                    raise XZFormatError(f"Distance {dist} exceeds available history {self.cur_block_pos + self.history.history_len()}")
                                 self.in_match_copy = True
                                 self.match_dist = dist
                                 self.match_rem = length
@@ -1330,6 +1470,8 @@ class XZStreamDecompressor:
                         self.rd_code = rd.code
                         self.rd_range = rd.range
                         self.comp_offset = c_off
+                        if c_off != len(comp_bytes) or rd.code != 0:
+                            raise XZFormatError(f"LZMA chunk exactness violation: c_off={c_off}/{len(comp_bytes)} code={rd.code}")
 
             if self.phase == "BLOCK_END":
                 if self.cur_block_pos > 0:
@@ -1487,9 +1629,9 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                   progress_callback=None, history_backend="auto",
                   timeout=52.0, cpu_timeout=22.0, deadline=None,
                   block_size="auto", storage_dir=None, memory_limit=None,
-                  force_gc=True):
+                  force_gc=True, resume_mode="auto", checkpoint_interval="8m"):
     """
-    Callable interface for XZ decompression.
+    Callable interface for XZ decompression with persistent checkpoint resumption.
     """
     if isinstance(input_source, (str, Path)):
         if str(input_source) == "-":
@@ -1518,14 +1660,6 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
     actual_block_size = select_block_size(block_size, available_mem=avail_mem)
     is_stream_output = (output_target == "-")
     is_stream_input = (input_source == "-") or not is_seekable(in_stream)
-
-    # Verify resume offsets if specified
-    if resume_from is not None:
-        if isinstance(history, DirectoryBlockHistoryStore):
-            if not history.state_files:
-                raise RuntimeError(f"Hard resumption error: no state found for --resume-from={resume_from}")
-        if is_seekable(in_stream):
-            in_stream.seek(resume_from)
 
     engine = XZStreamDecompressor(in_stream, history, block_size=actual_block_size, force_gc=force_gc)
 
@@ -1574,6 +1708,63 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
         except (ValueError, OSError, AttributeError):
             pass
 
+    # Checkpoint helpers (§3.3)
+    def _compute_input_id(stream):
+        if is_seekable(stream):
+            cur = stream.tell()
+            stream.seek(0)
+            hdr = stream.read(4096)
+            stream.seek(0, 2)
+            sz = stream.tell()
+            stream.seek(cur)
+            return f"{crc32(hdr):08x}:{sz}"
+        return None
+
+    def _load_best_checkpoint(r_dir, exp_input_id=None):
+        best_rec = None
+        best_txn = -1
+        for j_name in ("STATE_A.json", "STATE_B.json"):
+            jp = Path(r_dir) / j_name
+            if jp.exists():
+                try:
+                    rec = json.loads(jp.read_text(encoding="utf-8"))
+                    state_raw = rec.get("state")
+                    stored_crc = rec.get("payload_crc32")
+                    calc_crc = crc32(json.dumps(state_raw, sort_keys=True).encode("utf-8"))
+                    if stored_crc != calc_crc:
+                        continue
+                    if exp_input_id and rec.get("input_id"):
+                        if rec.get("input_id") != exp_input_id:
+                            continue
+                    txn = rec.get("txn", 0)
+                    if txn > best_txn:
+                        best_txn = txn
+                        best_rec = rec
+                except Exception:
+                    pass
+        return best_rec
+
+    txn_counter = 0
+    def _write_checkpoint(r_dir, engine_obj, hist_obj, inp_id):
+        nonlocal txn_counter
+        txn_counter += 1
+        state_rec = engine_obj.export_state()
+        state_rec["history_total"] = hist_obj.total_history_written if hasattr(hist_obj, "total_history_written") else hist_obj.history_len()
+        state_rec["history_tail_crc32"] = hist_obj.tail_crc32()
+        state_bytes = json.dumps(state_rec, sort_keys=True).encode("utf-8")
+        payload_crc = crc32(state_bytes)
+        rec = {
+            "version": 1,
+            "txn": txn_counter,
+            "input_id": inp_id,
+            "payload_crc32": payload_crc,
+            "state": state_rec
+        }
+        target_j = Path(r_dir) / ("STATE_A.json" if (txn_counter % 2 == 1) else "STATE_B.json")
+        tmp_j = Path(r_dir) / ".tmp_state.json"
+        tmp_j.write_text(json.dumps(rec), encoding="utf-8")
+        atomic_replace(tmp_j, target_j)
+
     curr_out_stream = None
     curr_dest_path = None
     curr_part_path = None
@@ -1582,31 +1773,67 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
     if is_stream_output:
         curr_out_stream = sys.stdout.buffer
     else:
-        # Ensure stream 0 output file is opened at startup (§5.1)
         base_dest = format_suffixed_filename(output_target, 0)
         curr_dest_path = Path(base_dest)
         target_file = curr_dest_path if in_place else Path(f"{base_dest}.part")
         curr_part_path = target_file if not in_place else None
-        if target_file.exists() and resume_dir:
-            verify_output_mode = True
-            verify_file_len = target_file.stat().st_size
-            verify_file_handle = open(target_file, "r+b")
-            verified_offset = 0
-        else:
-            if not in_place and target_file.exists() and not resume_dir:
-                target_file.unlink()
-            curr_out_stream = open(target_file, "wb")
-            verify_output_mode = False
 
-    # Verify-output mode tracking for resumable disk destination
     verify_output_mode = False
     verify_file_handle = None
     verify_file_len = 0
     verified_offset = 0
 
+    inp_id = _compute_input_id(in_stream) if not is_stream_input else None
+    checkpoint_resumed = False
+
+    # Checkpoint restore check on start
+    if resume_dir and resume_mode != "off":
+        ckpt = _load_best_checkpoint(resume_dir, inp_id)
+        if ckpt is not None:
+            state_dict = ckpt["state"]
+            txn_counter = ckpt.get("txn", 0)
+            out_off = state_dict.get("overall_output_offset", 0)
+            hist_tot = state_dict.get("history_total", 0)
+            exp_tail_crc = state_dict.get("history_tail_crc32")
+            history.truncate_to(hist_tot)
+            if exp_tail_crc is not None and history.tail_crc32() != exp_tail_crc:
+                if resume_mode == "checkpoint":
+                    raise XZResourceError("History tail CRC32 mismatch on checkpoint restore")
+            else:
+                if not is_stream_output and curr_part_path and curr_part_path.exists():
+                    with open(str(curr_part_path), "r+b") as f:
+                        f.seek(out_off)
+                        f.truncate()
+                    curr_out_stream = open(str(curr_part_path), "a+b")
+                    curr_out_stream.seek(out_off)
+                in_off = state_dict.get("input_offset", 0)
+                if is_seekable(in_stream):
+                    in_stream.seek(in_off)
+                engine.import_state(state_dict)
+                checkpoint_resumed = True
+        elif resume_mode == "checkpoint":
+            raise XZResourceError("No valid checkpoint found for checkpoint resumption")
+        else:
+            # Fall back to verify-output mode
+            if not is_stream_output and curr_part_path and curr_part_path.exists():
+                verify_output_mode = True
+                verify_file_len = curr_part_path.stat().st_size
+                verify_file_handle = open(str(curr_part_path), "r+b")
+                verified_offset = 0
+                if timeout_sec > 0 or cpu_timeout_sec > 0:
+                    sys.stderr.write("xz_decompressor: warning: Verify-Output mode cannot converge when stream decode time exceeds timeout; use checkpoint mode with a persistent backend.\n")
+                    sys.stderr.flush()
+
+    if not is_stream_output and curr_out_stream is None and not verify_output_mode:
+        if not in_place and curr_part_path and curr_part_path.exists() and not resume_dir:
+            curr_part_path.unlink()
+        curr_out_stream = open(str(curr_part_path or curr_dest_path), "wb")
+
+    ckpt_interval_bytes = parse_memory_size(checkpoint_interval) or (8 * 1024 * 1024)
+    bytes_since_ckpt = 0
+
     try:
         for event in engine.decode_events():
-            # Cooperative clock-checking enforced slightly early (0.15s margin)
             coop_margin = 0.15
             if timeout_sec and timeout_sec > 0:
                 if (time.perf_counter() - init_perf) >= (timeout_sec - coop_margin):
@@ -1618,31 +1845,9 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                     cpu_now = time.perf_counter()
                 if (cpu_now - init_cpu) >= (cpu_timeout_sec - coop_margin):
                     raise CPUTimeout("CPU timeout reached (cooperative check)")
+
             if event.type == XZEventType.CHUNK_OUTPUT:
-                if not is_stream_output and curr_out_stream is None and verify_file_handle is None:
-                    base_dest = format_suffixed_filename(output_target, stream_idx)
-                    curr_dest_path = Path(base_dest)
-
-                    if in_place:
-                        target_file = curr_dest_path
-                    else:
-                        target_file = Path(f"{base_dest}.part")
-                        curr_part_path = target_file
-
-                    # Check if file exists to enter verify-output mode
-                    if target_file.exists() and resume_dir:
-                        verify_output_mode = True
-                        verify_file_len = target_file.stat().st_size
-                        verify_file_handle = open(target_file, "r+b")
-                        verified_offset = 0
-                    else:
-                        if not in_place and target_file.exists() and not resume_dir:
-                            target_file.unlink()
-                        curr_out_stream = open(target_file, "wb")
-                        verify_output_mode = False
-
                 if verify_output_mode:
-                    # Compare block against existing file
                     space = len(event.data)
                     if verified_offset + space <= verify_file_len:
                         verify_file_handle.seek(verified_offset)
@@ -1650,7 +1855,6 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                         if existing_chunk == event.data:
                             verified_offset += space
                         else:
-                            # Mismatch! Truncate output file to verified_offset
                             verify_file_handle.seek(verified_offset)
                             verify_file_handle.truncate()
                             verify_file_handle.write(event.data)
@@ -1658,7 +1862,6 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                             curr_out_stream = verify_file_handle
                             verify_output_mode = False
                     else:
-                        # Reached beyond existing file
                         match_len = verify_file_len - verified_offset
                         if match_len > 0:
                             verify_file_handle.seek(verified_offset)
@@ -1679,6 +1882,13 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                 else:
                     curr_out_stream.write(event.data)
                     curr_out_stream.flush()
+
+            elif event.type == XZEventType.BLOCK_COMMITTED:
+                if resume_dir and getattr(history, "persistent", False) and resume_mode != "off":
+                    bytes_since_ckpt += len(event.block_data)
+                    if ckpt_interval_bytes > 0 and bytes_since_ckpt >= ckpt_interval_bytes:
+                        _write_checkpoint(resume_dir, engine, history, inp_id)
+                        bytes_since_ckpt = 0
 
             elif event.type == XZEventType.PROGRESS:
                 if progress_callback:
@@ -1710,7 +1920,7 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                         curr_part_path = target_file if not in_place else None
                         if not in_place and target_file.exists():
                             target_file.unlink()
-                        curr_out_stream = open(target_file, "wb")
+                        curr_out_stream = open(str(target_file), "wb")
                         dest_desc = str(curr_dest_path)
 
                     sys.stderr.write(
@@ -1740,9 +1950,17 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                 atomic_replace(curr_part_path, curr_dest_path)
 
         if resume_dir:
+            for j in ("STATE_A.json", "STATE_B.json", ".tmp_state.json"):
+                (Path(resume_dir) / j).unlink(missing_ok=True)
             history.cleanup()
 
     except (KeyboardInterrupt, WallClockTimeout, CPUTimeout) as exc:
+        if resume_dir and getattr(history, "persistent", False) and resume_mode != "off":
+            try:
+                _write_checkpoint(resume_dir, engine, history, inp_id)
+            except Exception:
+                pass
+
         if isinstance(exc, WallClockTimeout):
             msg = "\nDecompression timed out (wall-clock deadline reached)."
         elif isinstance(exc, CPUTimeout):
@@ -1754,32 +1972,30 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
             msg += f" To resume, run with: --resume-dir={resume_dir}"
         if not is_seekable(in_stream):
             msg += f" --resume-from={engine.overall_input_offset}"
-        if not is_stream_output and not is_seekable(curr_out_stream):
+        if not is_stream_output and curr_out_stream and not is_seekable(curr_out_stream):
             msg += f" --resume-at={engine.overall_output_offset}"
         sys.stderr.write(msg + "\n")
         sys.stderr.flush()
         raise
     finally:
-        # Reset signal handlers and timers
-        if hasattr(signal, 'SIGALRM') and sig_alarm_old is not None:
-            try:
-                if hasattr(signal, 'setitimer'):
-                    signal.setitimer(signal.ITIMER_REAL, 0)
-                else:
-                    signal.alarm(0)
+        try:
+            if hasattr(signal, 'setitimer') and hasattr(signal, 'ITIMER_REAL'):
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            elif hasattr(signal, 'alarm'):
+                signal.alarm(0)
+            if hasattr(signal, 'SIGALRM') and sig_alarm_old is not None:
                 signal.signal(signal.SIGALRM, sig_alarm_old)
-            except (ValueError, OSError, AttributeError):
-                pass
-        if hasattr(signal, 'SIGVTALRM') and sig_vtalrm_old is not None:
-            try:
+        except Exception:
+            pass
+        try:
+            if hasattr(signal, 'setitimer') and hasattr(signal, 'ITIMER_VIRTUAL'):
                 signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+            if hasattr(signal, 'SIGVTALRM') and sig_vtalrm_old is not None:
                 signal.signal(signal.SIGVTALRM, sig_vtalrm_old)
-            except (ValueError, OSError, AttributeError):
-                pass
+        except Exception:
+            pass
 
     return engine.overall_output_offset
-
-# --- Built-In Unittest Suite (Lazy Imported for CircuitPython Compatibility) ---
 
 try:
     import unittest
@@ -2371,6 +2587,118 @@ class TestXZDecompressor(_TestCaseBase):
         out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
         self.assertEqual(out, data)
 
+
+    def test_regression_checkpoint_resume_convergence(self):
+        lzma = self.lzma
+        if lzma is None: self.skipTest("lzma oracle not available")
+        import io
+        raw = b"CHECKPOINT_CONVERGENCE_TEST_PAYLOAD_" * 5000 # 180,000 bytes spanning multiple blocks
+        xz_data = lzma.compress(raw, preset=6)
+
+        r_dir = Path("/tmp/test_ckpt_converge")
+        r_dir.mkdir(parents=True, exist_ok=True)
+        out_f = Path("/tmp/test_ckpt_converge_out.bin")
+        out_f.unlink(missing_ok=True)
+
+        # Repeated short timeout runs until finished
+        max_runs = 10
+        finished = False
+        for run_i in range(max_runs):
+            try:
+                decompress_xz(
+                    io.BytesIO(xz_data),
+                    str(out_f),
+                    resume_dir=str(r_dir),
+                    resume_mode="auto",
+                    timeout=0.25,
+                    cpu_timeout=0.25,
+                    in_place=True
+                )
+                finished = True
+                break
+            except (WallClockTimeout, CPUTimeout):
+                pass
+
+        self.assertTrue(finished, f"Failed to converge within {max_runs} runs")
+        self.assertEqual(out_f.read_bytes(), raw)
+        out_f.unlink(missing_ok=True)
+        r_dir.rmdir()
+
+    def test_regression_malformed_lzma2_and_properties(self):
+        lzma = self.lzma
+        if lzma is None: self.skipTest("lzma oracle not available")
+        import io, struct
+        data = b"MALFORMED_VALIDATION_TEST" * 10
+        good_xz = bytearray(lzma.compress(data, check=lzma.CHECK_CRC32))
+
+        # 1. Block header dict prop = 0x40 (> 40)
+        bad_prop_xz = bytearray(good_xz)
+        bad_prop_xz[16] = 0x40
+        h_sz = (bad_prop_xz[12] + 1) * 4
+        bad_prop_xz[12 + h_sz - 4 : 12 + h_sz] = struct.pack("<I", crc32(bad_prop_xz[12 : 12 + h_sz - 4]))
+        with self.assertRaises(XZFormatError):
+            engine = XZStreamDecompressor(io.BytesIO(bytes(bad_prop_xz)))
+            list(engine.decode_events())
+
+        # 2. First chunk ctrl byte = 0x02 (uncompressed without dict reset)
+        h_end = 12 + h_sz
+        if bad_prop_xz[h_end] in (0x01, 0x02):
+            bad_ctrl_xz = bytearray(good_xz)
+            bad_ctrl_xz[h_end] = 0x02
+            with self.assertRaises(XZFormatError):
+                engine = XZStreamDecompressor(io.BytesIO(bytes(bad_ctrl_xz)))
+                list(engine.decode_events())
+
+    def test_backend_protocol_conformance(self):
+        # 1. MemoryHistory protocol
+        mh = MemoryHistory(max_history=1024)
+        self.assertFalse(mh.persistent)
+        mh.append_block(b"0123456789" * 10, 0)
+        self.assertEqual(mh.history_len(), 100)
+        self.assertGreater(mh.tail_crc32(), 0)
+        # Invalid distance > history_len raises XZFormatError
+        with self.assertRaises(XZFormatError):
+            mh.get_history_slice(101, 1)
+        with self.assertRaises(XZFormatError):
+            mh.get_history_slice(0, 1)
+        mh.truncate_to(50)
+        self.assertEqual(mh.history_len(), 50)
+        mh.reset()
+        self.assertEqual(mh.history_len(), 0)
+        mh.cleanup()
+
+        # 2. DirectoryBlockHistoryStore protocol
+        w_dir = Path("/tmp/test_dir_proto")
+        w_dir.mkdir(parents=True, exist_ok=True)
+        ds = DirectoryBlockHistoryStore(w_dir, max_blocks=3)
+        self.assertTrue(ds.persistent)
+        ds.append_block(b"PAGED_DATA_" * 10, 0)
+        self.assertGreater(ds.history_len(), 0)
+        self.assertGreater(ds.tail_crc32(), 0)
+        with self.assertRaises(XZFormatError):
+            ds.get_history_slice(ds.history_len() + 10, 1)
+        # Test reset unlinks page files
+        self.assertGreater(len(list(w_dir.glob("*.page"))), 0)
+        ds.reset()
+        self.assertEqual(ds.history_len(), 0)
+        self.assertEqual(len(list(w_dir.glob("*.page"))), 0)
+        ds.cleanup()
+
+        # 3. FileHistory protocol
+        fpath = Path("/tmp/test_fh_proto.bin")
+        fh = FileHistory(fpath, max_history=1024)
+        self.assertTrue(fh.persistent)
+        fh.append_block(b"FILE_DATA_" * 10, 0)
+        self.assertGreater(fh.history_len(), 0)
+        self.assertGreater(fh.tail_crc32(), 0)
+        with self.assertRaises(XZFormatError):
+            fh.get_history_slice(fh.history_len() + 10, 1)
+        fh.truncate_to(30)
+        self.assertEqual(fh.history_len(), 30)
+        fh.reset()
+        self.assertEqual(fh.history_len(), 0)
+        fh.cleanup()
+
 def main():
     try:
         import argparse
@@ -2393,6 +2721,10 @@ def main():
         parser.add_argument("--timeout", default="52s", help="Wall-clock timeout [<N>s|<N>m|0] (default: 52s)")
         parser.add_argument("--cpu-timeout", default="22s", help="CPU timeout [<N>s|<N>m|0] (default: 22s)")
         parser.add_argument("--deadline", default=None, help="Absolute UTC deadline instant (ISO-8601)")
+        parser.add_argument("--resume-mode", choices=["auto", "checkpoint", "verify", "off"], default="auto",
+                            help="Resumption mode: auto (default), checkpoint, verify, off")
+        parser.add_argument("--checkpoint-interval", default="8m",
+                            help="Periodic checkpoint spacing [<N>|<N>k|<N>m|<N>g bytes | <N>s] (default: 8m)")
         parser.add_argument("--history-backend", choices=["auto", "memory", "directory", "file"], default="auto",
                             help="Storage backend: auto (<72MB switches to disk), memory, directory, file")
         parser.add_argument("--block-size", default="auto",
@@ -2480,7 +2812,9 @@ def main():
             block_size=b_size,
             storage_dir=s_dir,
             memory_limit=m_limit,
-            force_gc=f_gc
+            force_gc=f_gc,
+            resume_mode=getattr(args, "resume_mode", "auto") if argparse else "auto",
+            checkpoint_interval=getattr(args, "checkpoint_interval", "8m") if argparse else "8m"
         )
     except (WallClockTimeout, CPUTimeout):
         sys.exit(124)
