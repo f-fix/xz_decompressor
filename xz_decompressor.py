@@ -1,4 +1,3 @@
-import io
 """
 Pure-Python XZ / LZMA2 Streaming Decompression Engine.
 Zero required external dependencies, apart from --test mode.
@@ -11,6 +10,7 @@ import struct
 import hashlib
 import json
 from pathlib import Path
+import io
 
 # MicroPython native machine code decorator shim
 try:
@@ -202,9 +202,9 @@ class BlockCommittedEvent:
         self.state_record = state_record
 
 class StreamBoundaryEvent:
-    def __init__(self, stream_index, next_stream_index,
-                 input_stream_len, overall_input_offset,
-                 output_stream_len, overall_output_offset):
+    def __init__(self, stream_index, next_stream_index=None,
+                 input_stream_len=0, overall_input_offset=0,
+                 output_stream_len=0, overall_output_offset=0, has_next=False):
         self.type = XZEventType.STREAM_BOUNDARY
         self.stream_index = stream_index
         self.next_stream_index = next_stream_index
@@ -212,6 +212,7 @@ class StreamBoundaryEvent:
         self.overall_input_offset = overall_input_offset
         self.output_stream_len = output_stream_len
         self.overall_output_offset = overall_output_offset
+        self.has_next = has_next
 
 class ProgressEvent:
     def __init__(self, block_index, bytes_decoded, total_emitted):
@@ -396,91 +397,133 @@ class MemoryHistory(HistoryBackend):
 
 class DirectoryBlockHistoryStore(HistoryBackend):
     """
-    Circular buffer of up to 1025 64 KiB files on disk in a working directory.
-    Files are named <input_hash>_<index:08d>.block and <input_hash>_<index:08d>.state.
-    Atomic commits via temporary files.
+    Fixed 64 KiB page-based storage (HISTORY_PAGE = 65536) conforming to §3.2A.
+    Decoupled from engine block size (4-64 KiB).
     """
-    def __init__(self, work_dir, max_blocks=1025):
+    persistent = True
+    HISTORY_PAGE = 65536
+
+    def __init__(self, work_dir, max_history=67108864, max_blocks=None):
         self.work_dir = Path(work_dir).resolve()
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        self.max_blocks = max_blocks
-        self.block_files = {} # block_index -> Path
-        self.state_files = {} # block_index -> Path
-        self.lru_cache = {}   # block_index -> bytes (up to 2 blocks in RAM)
+        if max_blocks is not None:
+            self.max_pages = max_blocks
+            self.max_history = max_blocks * self.HISTORY_PAGE
+        else:
+            self.max_history = max_history
+            self.max_pages = (max_history // self.HISTORY_PAGE) + 1 # 1025
+        self.total_history_written = 0
+        self.page_files = {}   # page_index -> Path
+        self.block_files = self.page_files # backward compatible alias
+        self.state_files = {}  # block_index -> Path
+        self.lru_cache = {}    # page_index -> bytearray
         self.lru_order = []
         self._scan_existing()
 
     def _scan_existing(self):
-        self.block_files.clear()
+        self.page_files.clear()
         self.state_files.clear()
+        for p in sorted(self.work_dir.glob("*_*.page")):
+            parts = p.stem.split("_")
+            if len(parts) >= 2 and parts[-1].isdigit():
+                idx = int(parts[-1])
+                self.page_files[idx] = p
         for p in sorted(self.work_dir.glob("*_*.block")):
             parts = p.stem.split("_")
             if len(parts) >= 2 and parts[-1].isdigit():
                 idx = int(parts[-1])
-                self.block_files[idx] = p
+                self.page_files[idx] = p
         for p in sorted(self.work_dir.glob("*_*.state")):
             parts = p.stem.split("_")
             if len(parts) >= 2 and parts[-1].isdigit():
                 idx = int(parts[-1])
                 self.state_files[idx] = p
 
-    def append_block(self, block_data, block_index=0, input_hash="0000000000000000"):
-        target_name = f"{input_hash}_{block_index:08d}.block"
-        target_path = self.work_dir / target_name
-        tmp_path = self.work_dir / f".tmp_{target_name}"
-        tmp_path.write_bytes(block_data)
-        atomic_replace(tmp_path, target_path)
-        self.block_files[block_index] = target_path
+    def append_block(self, block_data: bytes, block_index: int = 0, input_hash: str = "0000000000000000") -> None:
+        rem = len(block_data)
+        off_in_block = 0
+        while rem > 0:
+            page_idx = self.total_history_written // self.HISTORY_PAGE
+            page_off = self.total_history_written % self.HISTORY_PAGE
+            space = self.HISTORY_PAGE - page_off
+            take = min(rem, space)
+            chunk = block_data[off_in_block : off_in_block + take]
 
-        # Update RAM cache
-        self.lru_cache[block_index] = block_data
-        self.lru_order.append(block_index)
-        while len(self.lru_order) > 2:
-            old_idx = self.lru_order.pop(0)
-            self.lru_cache.pop(old_idx, None)
+            page_name = f"{input_hash}_{page_idx:08d}.page"
+            page_path = self.work_dir / page_name
 
-        # Evict blocks older than max_blocks
-        if block_index >= self.max_blocks:
-            self.evict_prior(block_index - self.max_blocks + 1)
+            with open(page_path, "a+b") as f:
+                f.seek(page_off)
+                f.write(chunk)
+                f.flush()
+            self.page_files[page_idx] = page_path
 
-    def get_history_slice(self, distance, length):
-        if not self.block_files:
-            return b""
-        latest_idx = max(self.block_files.keys())
-        res = bytearray()
-        rem_len = length
-        curr_dist = distance
-
-        while rem_len > 0:
-            block_offset = (curr_dist - 1) // 65536
-            target_block_idx = latest_idx - block_offset
-            if target_block_idx not in self.block_files:
-                break
-
-            if target_block_idx in self.lru_cache:
-                bdata = self.lru_cache[target_block_idx]
-            else:
-                bdata = self.block_files[target_block_idx].read_bytes()
-                self.lru_cache[target_block_idx] = bdata
-                self.lru_order.append(target_block_idx)
-                if len(self.lru_order) > 2:
+            if page_idx not in self.lru_cache:
+                self.lru_cache[page_idx] = bytearray()
+                self.lru_order.append(page_idx)
+                if len(self.lru_order) > 4:
                     old_idx = self.lru_order.pop(0)
                     self.lru_cache.pop(old_idx, None)
+            
+            p_buf = self.lru_cache[page_idx]
+            if len(p_buf) < page_off:
+                p_buf[:] = page_path.read_bytes()
+            p_buf[page_off : page_off + len(chunk)] = chunk
 
-            pos_from_end = (curr_dist - 1) % 65536
-            start_in_block = len(bdata) - 1 - pos_from_end
-            if start_in_block < 0:
+            self.total_history_written += take
+            off_in_block += take
+            rem -= take
+
+            if page_idx >= self.max_pages:
+                self.evict_prior(page_idx - self.max_pages + 1)
+
+    def get_history_slice(self, distance: int, length: int) -> bytes:
+        if distance <= 0 or distance > self.total_history_written or length <= 0:
+            return b""
+        abs_start = self.total_history_written - distance
+        res = bytearray()
+        curr_abs = abs_start
+        rem_len = min(length, distance)
+
+        while rem_len > 0:
+            page_idx = curr_abs // self.HISTORY_PAGE
+            page_off = curr_abs % self.HISTORY_PAGE
+            if page_idx not in self.page_files:
                 break
-            bytes_avail = min(rem_len, len(bdata) - start_in_block)
-            part = bdata[start_in_block : start_in_block + bytes_avail]
+            avail = min(rem_len, self.HISTORY_PAGE - page_off)
+
+            if page_idx in self.lru_cache and len(self.lru_cache[page_idx]) >= page_off + avail:
+                part = self.lru_cache[page_idx][page_off : page_off + avail]
+            else:
+                p_path = self.page_files[page_idx]
+                with open(p_path, "rb") as f:
+                    f.seek(page_off)
+                    part = f.read(avail)
+                if page_idx not in self.lru_cache:
+                    self.lru_cache[page_idx] = bytearray(p_path.read_bytes())
+                    self.lru_order.append(page_idx)
+                    if len(self.lru_order) > 4:
+                        old_idx = self.lru_order.pop(0)
+                        self.lru_cache.pop(old_idx, None)
+
             res.extend(part)
+            curr_abs += len(part)
             rem_len -= len(part)
-            curr_dist -= len(part)
             if len(part) == 0:
                 break
         return bytes(res)
 
-    def checkpoint(self, block_index, state_record, input_hash="0000000000000000"):
+    def history_len(self) -> int:
+        return min(self.total_history_written, self.max_history)
+
+    def tail_crc32(self, n: int = 65536) -> int:
+        avail = min(n, self.total_history_written)
+        if avail <= 0:
+            return 0
+        tail_bytes = self.get_history_slice(avail, avail)
+        return crc32(tail_bytes)
+
+    def checkpoint(self, block_index: int, state_record: dict, input_hash: str = "0000000000000000") -> None:
         target_name = f"{input_hash}_{block_index:08d}.state"
         target_path = self.work_dir / target_name
         tmp_path = self.work_dir / f".tmp_{target_name}"
@@ -488,7 +531,7 @@ class DirectoryBlockHistoryStore(HistoryBackend):
         atomic_replace(tmp_path, target_path)
         self.state_files[block_index] = target_path
 
-    def restore(self, block_index):
+    def restore(self, block_index: int) -> dict:
         if block_index in self.state_files:
             try:
                 return json.loads(self.state_files[block_index].read_text())
@@ -496,39 +539,45 @@ class DirectoryBlockHistoryStore(HistoryBackend):
                 return None
         return None
 
-    def evict_prior(self, min_retained_block):
-        to_del = [idx for idx in self.block_files if idx < min_retained_block]
+    def truncate_to(self, history_total: int) -> None:
+        self.total_history_written = history_total
+        curr_page = history_total // self.HISTORY_PAGE
+        curr_off = history_total % self.HISTORY_PAGE
+
+        to_del = [idx for idx in list(self.page_files.keys()) if idx > curr_page]
         for idx in to_del:
-            try:
-                self.block_files[idx].unlink(missing_ok=True)
-            except Exception:
-                pass
-            self.block_files.pop(idx, None)
-            if idx in self.state_files:
-                try:
-                    self.state_files[idx].unlink(missing_ok=True)
-                except Exception:
-                    pass
-                self.state_files.pop(idx, None)
+            self.page_files[idx].unlink(missing_ok=True)
+            self.page_files.pop(idx, None)
             self.lru_cache.pop(idx, None)
 
-    def reset(self):
+        if curr_page in self.page_files:
+            p_path = self.page_files[curr_page]
+            with open(p_path, "r+b") as f:
+                f.seek(curr_off)
+                f.truncate()
+            if curr_page in self.lru_cache:
+                del self.lru_cache[curr_page][curr_off:]
+
+    def evict_prior(self, min_retained_page: int) -> None:
+        to_del = [idx for idx in list(self.page_files.keys()) if idx < min_retained_page]
+        for idx in to_del:
+            self.page_files[idx].unlink(missing_ok=True)
+            self.page_files.pop(idx, None)
+            self.lru_cache.pop(idx, None)
+
+    def reset(self) -> None:
         self.lru_cache.clear()
         self.lru_order.clear()
-        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.total_history_written = 0
 
-    def cleanup(self):
+    def cleanup(self) -> None:
         self.lru_cache.clear()
         self.lru_order.clear()
         for p in self.work_dir.glob("*"):
-            try:
-                p.unlink()
-            except Exception:
-                pass
-        try:
-            self.work_dir.rmdir()
-        except Exception:
-            pass
+            try: p.unlink()
+            except Exception: pass
+        try: self.work_dir.rmdir()
+        except Exception: pass
 
 class FileHistory(HistoryBackend):
     def __init__(self, file_path, max_history=67108864):
@@ -699,6 +748,7 @@ class XZStreamDecompressor:
         self.stream_block_records = []
         self.tot_idx = 0
         self.pending_boundary = None
+        self._peeked_byte = None
         self.force_gc = force_gc
 
         self.PROB_INIT = 1024
@@ -819,7 +869,7 @@ class XZStreamDecompressor:
             "in_match_copy": self.in_match_copy,
             "match_dist": self.match_dist,
             "match_rem": self.match_rem,
-            "input_tell": self.input.tell() if hasattr(self.input, "tell") else 0,
+            "input_offset": self.overall_input_offset,
             "history": self.history.export_state() if hasattr(self.history, "export_state") else None
         }
 
@@ -880,8 +930,8 @@ class XZStreamDecompressor:
         self.in_match_copy = s["in_match_copy"]
         self.match_dist = s["match_dist"]
         self.match_rem = s["match_rem"]
-        if hasattr(self.input, "seek") and "input_tell" in s:
-            self.input.seek(s["input_tell"])
+        if hasattr(self.input, "seek") and "input_offset" in s and is_seekable(self.input):
+            self.input.seek(s["input_offset"])
         if hasattr(self.history, "import_state") and s["history"]:
             self.history.import_state(s["history"])
 
@@ -889,13 +939,18 @@ class XZStreamDecompressor:
         while True:
             if self.phase == "STREAM_HEADER":
                 while True:
-                    b = self.input.read(1)
+                    if self._peeked_byte is not None:
+                        b = self._peeked_byte
+                        self._peeked_byte = None
+                    else:
+                        b = self.input.read(1)
+                        if b:
+                            self.overall_input_offset += 1
                     if not b:
                         if self.null_count % 4 != 0:
                             raise XZFormatError("Stream padding not multiple of 4")
                         self.phase = "EOF"
                         return b"", True
-                    self.overall_input_offset += 1
                     self.input_hasher.update(b)
                     if b == b"\x00":
                         self.null_count += 1
@@ -1192,6 +1247,7 @@ class XZStreamDecompressor:
                                                     self.in_chunk = False
                                                 return committed, False
                                             continue
+                                        dist = self.reps[0]
                                     else:
                                         if rd.decode_bit(self.p_is_rep_g1, self.state) == 0:
                                             dist = self.reps[1]
@@ -1349,31 +1405,59 @@ class XZStreamDecompressor:
                     raise XZFormatError("Backward size mismatch")
                 if footer[8:10] != self.flags:
                     raise XZFormatError("Footer flags mismatch")
+                # Consume stream padding and peek next byte (§5.1, §5.4)
+                pad_nulls = 0
+                has_next = False
+                while True:
+                    pb = self.input.read(1)
+                    if not pb:
+                        if pad_nulls % 4 != 0:
+                            raise XZFormatError("Stream padding not multiple of 4")
+                        has_next = False
+                        self.phase = "EOF"
+                        break
+                    self.overall_input_offset += 1
+                    if pb == b"\x00":
+                        pad_nulls += 1
+                        continue
+                    elif pb == b"\xfd":
+                        if pad_nulls % 4 != 0:
+                            raise XZFormatError("Stream padding not multiple of 4")
+                        has_next = True
+                        self._peeked_byte = pb
+                        self.phase = "STREAM_HEADER"
+                        break
+                    else:
+                        raise XZFormatError(f"Unexpected byte after stream padding: 0x{pb[0]:02x}")
+
                 self.pending_boundary = StreamBoundaryEvent(
                     stream_index=self.stream_index,
-                    next_stream_index=self.stream_index + 1,
-                    input_stream_len=self.overall_input_offset - self.stream_start_in,
-                    overall_input_offset=self.overall_input_offset,
+                    next_stream_index=self.stream_index + 1 if has_next else None,
+                    input_stream_len=self.overall_input_offset - self.stream_start_in - (1 if has_next else 0),
+                    overall_input_offset=self.overall_input_offset - (1 if has_next else 0),
                     output_stream_len=self.overall_output_offset - self.stream_start_out,
-                    overall_output_offset=self.overall_output_offset
+                    overall_output_offset=self.overall_output_offset,
+                    has_next=has_next
                 )
                 self.stream_index += 1
-                self.phase = "STREAM_PADDING"
-                self.null_count = 0
+                return b"", (not has_next)
 
-            if self.phase == "STREAM_PADDING":
-                self.phase = "STREAM_HEADER"
 
     def decode_events(self):
         while True:
+            if self.pending_boundary:
+                ev = self.pending_boundary
+                self.pending_boundary = None
+                yield ev
             blk, is_eof = self.decode_block()
             if blk:
                 yield ChunkOutputEvent(blk)
                 yield BlockCommittedEvent(self.block_idx - 1, blk, self.export_state())
                 yield ProgressEvent(self.block_idx - 1, len(blk), self.overall_output_offset)
             if self.pending_boundary:
-                yield self.pending_boundary
+                ev = self.pending_boundary
                 self.pending_boundary = None
+                yield ev
             if is_eof:
                 break
 
@@ -1497,6 +1581,22 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
 
     if is_stream_output:
         curr_out_stream = sys.stdout.buffer
+    else:
+        # Ensure stream 0 output file is opened at startup (§5.1)
+        base_dest = format_suffixed_filename(output_target, 0)
+        curr_dest_path = Path(base_dest)
+        target_file = curr_dest_path if in_place else Path(f"{base_dest}.part")
+        curr_part_path = target_file if not in_place else None
+        if target_file.exists() and resume_dir:
+            verify_output_mode = True
+            verify_file_len = target_file.stat().st_size
+            verify_file_handle = open(target_file, "r+b")
+            verified_offset = 0
+        else:
+            if not in_place and target_file.exists() and not resume_dir:
+                target_file.unlink()
+            curr_out_stream = open(target_file, "wb")
+            verify_output_mode = False
 
     # Verify-output mode tracking for resumable disk destination
     verify_output_mode = False
@@ -1589,8 +1689,7 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                     if curr_out_stream is not None:
                         curr_out_stream.close()
                         curr_out_stream = None
-                        verify_file_handle = None
-                    elif verify_file_handle is not None:
+                    if verify_file_handle is not None:
                         verify_file_handle.close()
                         verify_file_handle = None
 
@@ -1599,19 +1698,33 @@ def decompress_xz(input_source, output_target=None, resume_dir=None,
                             curr_dest_path.unlink()
                         atomic_replace(curr_part_path, curr_dest_path)
 
-                next_stream = event.next_stream_index
-                if is_stream_output:
-                    dest_desc = f"stdout+{event.overall_output_offset}B"
-                else:
-                    dest_desc = format_suffixed_filename(output_target, next_stream)
+                if event.has_next:
+                    next_stream = event.next_stream_index
+                    stream_idx = next_stream
+                    if is_stream_output:
+                        dest_desc = f"stdout+{event.overall_output_offset}B"
+                    else:
+                        base_dest = format_suffixed_filename(output_target, next_stream)
+                        curr_dest_path = Path(base_dest)
+                        target_file = curr_dest_path if in_place else Path(f"{base_dest}.part")
+                        curr_part_path = target_file if not in_place else None
+                        if not in_place and target_file.exists():
+                            target_file.unlink()
+                        curr_out_stream = open(target_file, "wb")
+                        dest_desc = str(curr_dest_path)
 
-                sys.stderr.write(
-                    f"[xz:stream boundary] input_offset={event.overall_input_offset}B "
-                    f"stream_in={event.input_stream_len}B stream_out={event.output_stream_len}B "
-                    f"output_offset={event.overall_output_offset}B starting stream {next_stream} -> {dest_desc}\n"
-                )
-                sys.stderr.flush()
-                stream_idx = next_stream
+                    sys.stderr.write(
+                        f"[xz:stream boundary] input_offset={event.overall_input_offset}B "
+                        f"stream_in={event.input_stream_len}B stream_out={event.output_stream_len}B "
+                        f"output_offset={event.overall_output_offset}B starting stream {next_stream} -> {dest_desc}\n"
+                    )
+                    sys.stderr.flush()
+                else:
+                    sys.stderr.write(
+                        f"[xz:stream end] input_offset={event.overall_input_offset}B "
+                        f"output_offset={event.overall_output_offset}B streams={stream_idx + 1}\n"
+                    )
+                    sys.stderr.flush()
 
         if not is_stream_output:
             if curr_out_stream is not None:
@@ -2168,6 +2281,96 @@ class TestXZDecompressor(_TestCaseBase):
         self.assertEqual(parse_memory_size(262144), 262144)
         self.assertIsNone(parse_memory_size(None))
 
+
+    def test_regression_rep0_long_zeros(self):
+        lzma = self.lzma
+        import io
+        for size in [10000, 100000, 500000]: # 10k, 100k, 500k all-zeros
+            raw_zeros = bytes(size)
+            for preset in [0, 6]:
+                xz_data = lzma.compress(raw_zeros, preset=preset)
+                engine = XZStreamDecompressor(io.BytesIO(xz_data))
+                out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+                self.assertEqual(out, raw_zeros)
+
+    def test_regression_directory_block_sizes(self):
+        lzma = self.lzma
+        import io, random
+        prng = random.Random(999)
+        span1 = prng.randbytes(20000)
+        match_str = b"LONG_DISTANCE_MATCH_REGRESSION_PATTERN_" * 10
+        span2 = prng.randbytes(20000)
+        pat_data = span1 + match_str + span2 + match_str
+        xz_data = lzma.compress(pat_data, preset=6)
+
+        for b_sz in [4096, 8192, 16384, 65536]:
+            w_dir = Path(f"/tmp/test_dir_bs_{b_sz}")
+            w_dir.mkdir(parents=True, exist_ok=True)
+            store = DirectoryBlockHistoryStore(w_dir)
+            engine = XZStreamDecompressor(io.BytesIO(xz_data), history_backend=store, block_size=b_sz)
+            out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+            self.assertEqual(out, pat_data, f"Failed at block_size={b_sz}")
+            store.cleanup()
+
+    def test_regression_multi_stream_routing(self):
+        lzma = self.lzma
+        import io
+        s1 = b"STREAM_ZERO_CONTENT_" * 100
+        s2 = b"STREAM_ONE_CONTENT__" * 100
+        xz_multi = lzma.compress(s1) + (b"\x00" * 4) + lzma.compress(s2)
+
+        out_base = Path("/tmp/test_route_out.bin")
+        out_stream1 = Path("/tmp/test_route_out_1.bin")
+        out_base.unlink(missing_ok=True)
+        out_stream1.unlink(missing_ok=True)
+
+        decompress_xz(io.BytesIO(xz_multi), str(out_base), in_place=True)
+
+        self.assertTrue(out_base.exists())
+        self.assertTrue(out_stream1.exists())
+        self.assertEqual(out_base.read_bytes(), s1)
+        self.assertEqual(out_stream1.read_bytes(), s2)
+
+        out_base.unlink(missing_ok=True)
+        out_stream1.unlink(missing_ok=True)
+
+    def test_regression_empty_input_stream(self):
+        lzma = self.lzma
+        import io
+        empty_xz = lzma.compress(b"")
+        out_empty = Path("/tmp/test_empty_stream.bin")
+        out_empty.unlink(missing_ok=True)
+
+        decompress_xz(io.BytesIO(empty_xz), str(out_empty), in_place=True)
+
+        self.assertTrue(out_empty.exists())
+        self.assertEqual(out_empty.stat().st_size, 0)
+        out_empty.unlink(missing_ok=True)
+
+    def test_regression_non_seekable_input(self):
+        lzma = self.lzma
+        data = b"PIPE_NON_SEEKABLE_DATA_" * 500
+        xz_data = lzma.compress(data)
+
+        class NonSeekablePipe(io.RawIOBase):
+            def __init__(self, raw_bytes):
+                self.buf = io.BytesIO(raw_bytes)
+            def read(self, n=-1):
+                return self.buf.read(n)
+            def readable(self):
+                return True
+            def seekable(self):
+                return False
+            def seek(self, *args):
+                raise OSError(29, "Illegal seek")
+            def tell(self):
+                raise OSError(29, "Illegal seek")
+
+        pipe = NonSeekablePipe(xz_data)
+        engine = XZStreamDecompressor(pipe)
+        out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+        self.assertEqual(out, data)
+
 def main():
     try:
         import argparse
@@ -2258,7 +2461,7 @@ def main():
     def progress_cb(ev):
         glyph = spinner[spin_idx[0] % 4]
         spin_idx[0] += 1
-        sys.stderr.write(f"{glyph}\r")
+        if sys.stderr.isatty(): sys.stderr.write(f"{glyph}\r")
         sys.stderr.flush()
 
     try:
@@ -2283,6 +2486,36 @@ def main():
         sys.exit(124)
     except KeyboardInterrupt:
         sys.exit(130)
+    except XZFormatError as exc:
+        is_v = args.verbose if argparse is not None else False
+        if is_v: raise
+        sys.stderr.write(f"xz_decompressor: E_FORMAT: {exc}\n")
+        sys.exit(E_FORMAT)
+    except XZUnsupportedError as exc:
+        is_v = args.verbose if argparse is not None else False
+        if is_v: raise
+        sys.stderr.write(f"xz_decompressor: E_UNSUPPORTED: {exc}\n")
+        sys.exit(E_UNSUPPORTED)
+    except XZCheckError as exc:
+        is_v = args.verbose if argparse is not None else False
+        if is_v: raise
+        sys.stderr.write(f"xz_decompressor: E_CHECK: {exc}\n")
+        sys.exit(E_CHECK)
+    except (EOFError, ValueError) as exc:
+        is_v = args.verbose if argparse is not None else False
+        if is_v: raise
+        sys.stderr.write(f"xz_decompressor: E_FORMAT: {exc}\n")
+        sys.exit(E_FORMAT)
+    except OSError as exc:
+        is_v = args.verbose if argparse is not None else False
+        if is_v: raise
+        sys.stderr.write(f"xz_decompressor: E_IO: {exc}\n")
+        sys.exit(E_IO)
+    except Exception as exc:
+        is_v = args.verbose if argparse is not None else False
+        if is_v: raise
+        sys.stderr.write(f"xz_decompressor: E_RESOURCE: {exc}\n")
+        sys.exit(E_RESOURCE)
 
 if __name__ == "__main__":
     main()
