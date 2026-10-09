@@ -64,6 +64,22 @@ def is_seekable(stream):
         return False
 
 
+E_FORMAT = 1
+E_UNSUPPORTED = 1
+E_CHECK = 1
+E_RESOURCE = 1
+E_IO = 1
+E_DEADLINE = 124
+
+class XZFormatError(ValueError):
+    pass
+
+class XZUnsupportedError(ValueError):
+    pass
+
+class XZCheckError(ValueError):
+    pass
+
 class WallClockTimeout(Exception):
     """Raised when wall-clock timeout or deadline is reached."""
     pass
@@ -221,13 +237,22 @@ class MemoryHistory(HistoryBackend):
             del self.history[:len(self.history) - self.max_history]
 
     def get_history_slice(self, distance, length):
-        end_idx = len(self.history) - (distance - 1)
-        start_idx = end_idx - length
+        if distance <= 0:
+            return b""
+        start_idx = len(self.history) - distance
         if start_idx < 0:
             start_idx = 0
-        if end_idx <= 0 or start_idx >= len(self.history):
+        end_idx = min(len(self.history), start_idx + length)
+        if start_idx >= end_idx:
             return b""
         return bytes(self.history[start_idx:end_idx])
+
+    def export_state(self):
+        return {"max_history": self.max_history, "history": bytes(self.history).hex()}
+
+    def import_state(self, state):
+        self.max_history = state["max_history"]
+        self.history = bytearray(bytes.fromhex(state["history"]))
 
     def checkpoint(self, block_index, state_record, input_hash=""):
         self.checkpoints[block_index] = dict(state_record)
@@ -315,17 +340,14 @@ class DirectoryBlockHistoryStore(HistoryBackend):
                     self.lru_cache.pop(old_idx, None)
 
             pos_from_end = (curr_dist - 1) % 65536
-            byte_idx_end = len(bdata) - pos_from_end
-            bytes_available = min(rem_len, byte_idx_end)
-            byte_idx_start = byte_idx_end - bytes_available
-            if byte_idx_start < 0:
-                bytes_available += byte_idx_start
-                byte_idx_start = 0
-
-            part = bdata[byte_idx_start:byte_idx_end]
-            res = part + res
+            start_in_block = len(bdata) - 1 - pos_from_end
+            if start_in_block < 0:
+                break
+            bytes_avail = min(rem_len, len(bdata) - start_in_block)
+            part = bdata[start_in_block : start_in_block + bytes_avail]
+            res.extend(part)
             rem_len -= len(part)
-            curr_dist += len(part)
+            curr_dist -= len(part)
             if len(part) == 0:
                 break
         return bytes(res)
@@ -397,9 +419,10 @@ class FileHistory(HistoryBackend):
     def get_history_slice(self, distance, length):
         if distance > self.total_written:
             return b""
-        end_pos = self.total_written - (distance - 1)
-        start_pos = max(0, end_pos - length)
-        read_len = end_pos - start_pos
+        if distance <= 0:
+            return b""
+        start_pos = max(0, self.total_written - distance)
+        read_len = min(length, self.total_written - start_pos)
         self.f.seek(start_pos)
         return self.f.read(read_len)
 
@@ -413,11 +436,15 @@ class FileHistory(HistoryBackend):
 # --- Range Decoder ---
 
 class RangeDecoder:
-    def __init__(self, read_byte_fn):
+    def __init__(self, read_byte_fn, init_stream=True):
         self.read_byte = read_byte_fn
-        self.read_byte() # Discard first 0x00 byte
-        self.code = (self.read_byte() << 24) | (self.read_byte() << 16) | (self.read_byte() << 8) | self.read_byte()
-        self.range = 0xFFFFFFFF
+        if init_stream:
+            self.read_byte() # Discard first 0x00 byte
+            self.code = (self.read_byte() << 24) | (self.read_byte() << 16) | (self.read_byte() << 8) | self.read_byte()
+            self.range = 0xFFFFFFFF
+        else:
+            self.code = 0
+            self.range = 0xFFFFFFFF
 
     def decode_bit(self, probs, index):
         prob = probs[index]
@@ -485,7 +512,71 @@ class XZStreamDecompressor:
         self.block_size = block_size
         self.overall_input_offset = 0
         self.overall_output_offset = 0
+        self.stream_out_offset = 0
+        self.block_idx = 0
+        self.stream_index = 0
         self.input_hasher = hashlib.sha256()
+
+        self.phase = "STREAM_HEADER"
+        self.null_count = 0
+        self.stream_start_in = 0
+        self.stream_start_out = 0
+        self.flags = None
+        self.check_type = 0
+        self.cur_block = bytearray(self.block_size)
+        self.cur_block_pos = 0
+
+        self.bh_size = 0
+        self.compressed_bytes_in_block = 0
+        self.expected_comp_size = None
+        self.expected_uncomp_size = None
+        self.block_crc32 = 0
+        self.block_crc64 = 0
+        self.block_sha256 = None
+        self.block_uncomp_bytes = 0
+        self.stream_block_records = []
+        self.tot_idx = 0
+        self.pending_boundary = None
+
+        self.PROB_INIT = 1024
+        self.state = 0
+        self.reps = [0, 0, 0, 0]
+        self.lc = 3
+        self.lp = 0
+        self.pb = 2
+        self._reinit_probs()
+        self.p_lit = [self.PROB_INIT] * (0x300 << (self.lc + self.lp))
+
+        self.in_chunk = False
+        self.ctrl = 0
+        self.mode = 0
+        self.chunk_uncomp_sz = 0
+        self.chunk_comp_sz = 0
+        self.chunk_decoded = 0
+        self.chunk_compressed = b""
+        self.comp_offset = 0
+        self.raw_chunk = b""
+        self.raw_pos = 0
+        self.rd_code = 0
+        self.rd_range = 0
+
+        self.in_match_copy = False
+        self.match_dist = 0
+        self.match_rem = 0
+
+    def _reinit_probs(self):
+        PI = self.PROB_INIT
+        self.p_is_match = [PI] * (12 << 4)
+        self.p_is_rep = [PI] * 12
+        self.p_is_rep_g0 = [PI] * 12
+        self.p_is_rep_g1 = [PI] * 12
+        self.p_is_rep_g2 = [PI] * 12
+        self.p_is_rep0_long = [PI] * (12 << 4)
+        self.p_pos_slot = [PI] * (4 << 6)
+        self.p_spec_pos = [PI] * 115
+        self.p_align = [PI] * 16
+        self.p_len = [PI] * 386
+        self.p_rep_len = [PI] * 386
 
     def _read_exact(self, n):
         buf = bytearray()
@@ -500,400 +591,622 @@ class XZStreamDecompressor:
         self.input_hasher.update(buf)
         return bytes(buf)
 
-    def _read_vli(self):
-        val = 0
-        shift = 0
-        for _ in range(9):
-            b = self._read_exact(1)[0]
-            val |= (b & 0x7F) << shift
-            if (b & 0x80) == 0:
-                return val
-            shift += 7
-        raise ValueError("Invalid VLI encoding")
+    def _update_check(self, data):
+        self.block_uncomp_bytes += len(data)
+        if self.check_type == 1:
+            self.block_crc32 = crc32(data, self.block_crc32)
+        elif self.check_type == 4:
+            self.block_crc64 = crc64(data, self.block_crc64)
+        elif self.check_type == 10 and self.block_sha256:
+            self.block_sha256.update(data)
 
-    def decode_events(self):
-        stream_index = 0
+    def export_state(self):
+        return {
+            "overall_input_offset": self.overall_input_offset,
+            "overall_output_offset": self.overall_output_offset,
+            "stream_out_offset": self.stream_out_offset,
+            "block_idx": self.block_idx,
+            "stream_index": self.stream_index,
+            "phase": self.phase,
+            "null_count": self.null_count,
+            "stream_start_in": self.stream_start_in,
+            "stream_start_out": self.stream_start_out,
+            "flags": self.flags.hex() if self.flags else None,
+            "check_type": self.check_type,
+            "cur_block_pos": self.cur_block_pos,
+            "cur_block": self.cur_block[:self.cur_block_pos].hex(),
+            "bh_size": self.bh_size,
+            "compressed_bytes_in_block": self.compressed_bytes_in_block,
+            "expected_comp_size": self.expected_comp_size,
+            "expected_uncomp_size": self.expected_uncomp_size,
+            "block_crc32": self.block_crc32,
+            "block_crc64": self.block_crc64,
+            "block_uncomp_bytes": self.block_uncomp_bytes,
+            "stream_block_records": self.stream_block_records,
+            "tot_idx": self.tot_idx,
+            "state": self.state,
+            "reps": self.reps,
+            "lc": self.lc,
+            "lp": self.lp,
+            "pb": self.pb,
+            "p_is_match": self.p_is_match,
+            "p_is_rep": self.p_is_rep,
+            "p_is_rep_g0": self.p_is_rep_g0,
+            "p_is_rep_g1": self.p_is_rep_g1,
+            "p_is_rep_g2": self.p_is_rep_g2,
+            "p_is_rep0_long": self.p_is_rep0_long,
+            "p_pos_slot": self.p_pos_slot,
+            "p_spec_pos": self.p_spec_pos,
+            "p_align": self.p_align,
+            "p_len": self.p_len,
+            "p_rep_len": self.p_rep_len,
+            "p_lit": self.p_lit,
+            "in_chunk": self.in_chunk,
+            "ctrl": self.ctrl,
+            "mode": self.mode,
+            "chunk_uncomp_sz": self.chunk_uncomp_sz,
+            "chunk_comp_sz": self.chunk_comp_sz,
+            "chunk_decoded": self.chunk_decoded,
+            "chunk_compressed": self.chunk_compressed.hex(),
+            "comp_offset": self.comp_offset,
+            "raw_chunk": self.raw_chunk.hex(),
+            "raw_pos": self.raw_pos,
+            "rd_code": self.rd_code,
+            "rd_range": self.rd_range,
+            "in_match_copy": self.in_match_copy,
+            "match_dist": self.match_dist,
+            "match_rem": self.match_rem,
+            "input_tell": self.input.tell() if hasattr(self.input, "tell") else 0,
+            "history": self.history.export_state() if hasattr(self.history, "export_state") else None
+        }
+
+    def import_state(self, s):
+        self.overall_input_offset = s["overall_input_offset"]
+        self.overall_output_offset = s["overall_output_offset"]
+        self.stream_out_offset = s["stream_out_offset"]
+        self.block_idx = s["block_idx"]
+        self.stream_index = s["stream_index"]
+        self.phase = s["phase"]
+        self.null_count = s["null_count"]
+        self.stream_start_in = s["stream_start_in"]
+        self.stream_start_out = s["stream_start_out"]
+        self.flags = bytes.fromhex(s["flags"]) if s["flags"] else None
+        self.check_type = s["check_type"]
+        self.cur_block_pos = s["cur_block_pos"]
+        self.cur_block = bytearray(self.block_size)
+        cb = bytes.fromhex(s["cur_block"])
+        self.cur_block[:len(cb)] = cb
+        self.bh_size = s["bh_size"]
+        self.compressed_bytes_in_block = s["compressed_bytes_in_block"]
+        self.expected_comp_size = s["expected_comp_size"]
+        self.expected_uncomp_size = s["expected_uncomp_size"]
+        self.block_crc32 = s["block_crc32"]
+        self.block_crc64 = s["block_crc64"]
+        self.block_uncomp_bytes = s["block_uncomp_bytes"]
+        self.stream_block_records = s["stream_block_records"]
+        self.tot_idx = s.get("tot_idx", 0)
+        self.state = s["state"]
+        self.reps = s["reps"]
+        self.lc = s["lc"]
+        self.lp = s["lp"]
+        self.pb = s["pb"]
+        self.p_is_match = s["p_is_match"]
+        self.p_is_rep = s["p_is_rep"]
+        self.p_is_rep_g0 = s["p_is_rep_g0"]
+        self.p_is_rep_g1 = s["p_is_rep_g1"]
+        self.p_is_rep_g2 = s["p_is_rep_g2"]
+        self.p_is_rep0_long = s["p_is_rep0_long"]
+        self.p_pos_slot = s["p_pos_slot"]
+        self.p_spec_pos = s["p_spec_pos"]
+        self.p_align = s["p_align"]
+        self.p_len = s["p_len"]
+        self.p_rep_len = s["p_rep_len"]
+        self.p_lit = s["p_lit"]
+        self.in_chunk = s["in_chunk"]
+        self.ctrl = s["ctrl"]
+        self.mode = s["mode"]
+        self.chunk_uncomp_sz = s["chunk_uncomp_sz"]
+        self.chunk_comp_sz = s["chunk_comp_sz"]
+        self.chunk_decoded = s["chunk_decoded"]
+        self.chunk_compressed = bytes.fromhex(s["chunk_compressed"])
+        self.comp_offset = s["comp_offset"]
+        self.raw_chunk = bytes.fromhex(s["raw_chunk"])
+        self.raw_pos = s["raw_pos"]
+        self.rd_code = s["rd_code"]
+        self.rd_range = s["rd_range"]
+        self.in_match_copy = s["in_match_copy"]
+        self.match_dist = s["match_dist"]
+        self.match_rem = s["match_rem"]
+        if hasattr(self.input, "seek") and "input_tell" in s:
+            self.input.seek(s["input_tell"])
+        if hasattr(self.history, "import_state") and s["history"]:
+            self.history.import_state(s["history"])
+
+    def decode_block(self):
         while True:
-            # Handle stream header and RFC §2.1.2 4-byte null padding between streams
-            header_magic = bytearray()
-            while True:
-                b = self.input.read(1)
-                if not b:
-                    return # Clean EOF
-                self.overall_input_offset += 1
-                self.input_hasher.update(b)
-                if b == b"\x00":
-                    continue
-                if b == b"\xfd":
-                    header_magic.append(0xFD)
-                    rest = self._read_exact(5)
-                    header_magic.extend(rest)
-                    if bytes(header_magic) == b"\xfd7zXZ\x00":
-                        break
-                    else:
-                        raise ValueError(f"Invalid stream magic: {bytes(header_magic).hex()}")
-                else:
-                    raise ValueError(f"Unexpected byte before stream header: 0x{b[0]:02x}")
-
-            stream_start_in = self.overall_input_offset - 6
-            stream_start_out = self.overall_output_offset
-
-            # Stream Flags (2 bytes) + CRC32 (4 bytes)
-            flags = self._read_exact(2)
-            check_type = flags[1] & 0x0F
-            crc_bytes = self._read_exact(4)
-            if crc32(flags) != struct.unpack("<I", crc_bytes)[0]:
-                raise ValueError("Stream header CRC32 mismatch")
-
-            # Active block buffer
-            block_idx = 0
-            cur_block = bytearray(self.block_size)
-            cur_block_pos = 0
-            stream_out_offset = 0
-            self.history.reset()
-
-            # LZMA2 Decoder persistent state across chunks
-            PROB_INIT = 1024
-            state = 0
-            reps = [0, 0, 0, 0]
-            lc = 3
-            lp = 0
-            pb = 2
-            p_is_match = [PROB_INIT] * (12 << 4)
-            p_is_rep = [PROB_INIT] * 12
-            p_is_rep_g0 = [PROB_INIT] * 12
-            p_is_rep_g1 = [PROB_INIT] * 12
-            p_is_rep_g2 = [PROB_INIT] * 12
-            p_is_rep0_long = [PROB_INIT] * (12 << 4)
-            p_pos_slot = [PROB_INIT] * (4 << 6)
-            p_spec_pos = [PROB_INIT] * 115
-            p_align = [PROB_INIT] * 16
-            p_len = [PROB_INIT] * 386
-            p_rep_len = [PROB_INIT] * 386
-            p_lit = [PROB_INIT] * (0x300 << (lc + lp))
-
-            # Decode blocks within this stream
-            while True:
-                first_byte = self._read_exact(1)[0]
-                if first_byte == 0x00:
-                    # Index Indicator reached
-                    break
-
-                # Block Header Size: (first_byte + 1) * 4
-                bh_size = (first_byte + 1) * 4
-                bh_data = self._read_exact(bh_size - 1)
-                full_bh = bytes([first_byte]) + bh_data
-                header_crc = struct.unpack("<I", full_bh[-4:])[0]
-                if crc32(full_bh[:-4]) != header_crc:
-                    raise ValueError("Block header CRC32 mismatch")
-
-                compressed_bytes_in_block = 0
+            if self.phase == "STREAM_HEADER":
                 while True:
-                    ctrl = self._read_exact(1)[0]
-                    compressed_bytes_in_block += 1
-                    if ctrl == 0x00:
-                        break # EOS for this block's LZMA2 stream
+                    b = self.input.read(1)
+                    if not b:
+                        if self.null_count % 4 != 0:
+                            raise XZFormatError("Stream padding not multiple of 4")
+                        self.phase = "EOF"
+                        return b"", True
+                    self.overall_input_offset += 1
+                    self.input_hasher.update(b)
+                    if b == b"\x00":
+                        self.null_count += 1
+                        continue
+                    if b == b"\xfd":
+                        if self.null_count % 4 != 0:
+                            raise XZFormatError("Stream padding not multiple of 4")
+                        magic = bytearray([0xFD]) + self._read_exact(5)
+                        if bytes(magic) != b"\xfd7zXZ\x00":
+                            raise XZFormatError("Invalid magic")
+                        break
+                    raise XZFormatError(f"Unexpected byte 0x{b[0]:02x}")
+                self.stream_start_in = self.overall_input_offset - 6
+                self.stream_start_out = self.overall_output_offset
+                self.flags = self._read_exact(2)
+                if self.flags[0] != 0 or (self.flags[1] & 0xF0) != 0:
+                    raise XZFormatError("Invalid flags")
+                self.check_type = self.flags[1] & 0x0F
+                if self.check_type not in (0, 1, 4, 10):
+                    raise XZUnsupportedError(f"Unsupported check type: {self.check_type}")
+                crc_bytes = self._read_exact(4)
+                if crc32(self.flags) != struct.unpack("<I", crc_bytes)[0]:
+                    raise XZCheckError("Header CRC32 mismatch")
+                self.cur_block = bytearray(self.block_size)
+                self.cur_block_pos = 0
+                self.stream_out_offset = 0
+                self.history.reset()
+                self.stream_block_records = []
+                self.phase = "BLOCK_START"
 
-                    elif ctrl in (0x01, 0x02):
-                        # Uncompressed chunk
-                        sz_bytes = self._read_exact(2)
-                        compressed_bytes_in_block += 2
-                        chunk_sz = ((sz_bytes[0] << 8) | sz_bytes[1]) + 1
-                        raw_chunk = self._read_exact(chunk_sz)
-                        compressed_bytes_in_block += chunk_sz
+            if self.phase == "BLOCK_START":
+                fb = self._read_exact(1)[0]
+                if fb == 0:
+                    self.phase = "INDEX"
+                    continue
+                self.bh_size = (fb + 1) * 4
+                bh_data = self._read_exact(self.bh_size - 1)
+                full_bh = bytes([fb]) + bh_data
+                if crc32(full_bh[:-4]) != struct.unpack("<I", full_bh[-4:])[0]:
+                    raise XZCheckError("Block header CRC mismatch")
+                bflags = full_bh[1]
+                if (bflags & 0x03) != 0:
+                    raise XZUnsupportedError("Multi filter unsupported")
+                if (bflags & 0x3C) != 0:
+                    raise XZFormatError("Reserved flags non-zero")
+                has_comp = bool(bflags & 0x40)
+                has_uncomp = bool(bflags & 0x80)
+                off = 2
+                def _vli():
+                    nonlocal off; val = 0; s = 0
+                    for _ in range(9):
+                        b = full_bh[off]; off += 1
+                        val |= (b & 0x7F) << s
+                        if (b & 0x80) == 0: return val
+                        s += 7
+                    raise XZFormatError("Invalid VLI")
+                self.expected_comp_size = _vli() if has_comp else None
+                self.expected_uncomp_size = _vli() if has_uncomp else None
+                fid = _vli()
+                if fid != 0x21:
+                    raise XZUnsupportedError("Not LZMA2")
+                psz = _vli()
+                if psz != 1:
+                    raise XZFormatError("Invalid prop size")
+                pbyte = full_bh[off]; off += 1
+                dict_bits = pbyte & 0x3F
+                if dict_bits > 40:
+                    raise XZFormatError("Invalid dict bits")
+                while off < len(full_bh) - 4:
+                    if full_bh[off] != 0:
+                        raise XZFormatError("Non-zero header padding")
+                    off += 1
 
-                        raw_pos = 0
-                        while raw_pos < chunk_sz:
-                            space = self.block_size - cur_block_pos
-                            take = min(space, chunk_sz - raw_pos)
-                            cur_block[cur_block_pos : cur_block_pos + take] = raw_chunk[raw_pos : raw_pos + take]
-                            cur_block_pos += take
-                            raw_pos += take
+                self.block_crc32 = 0
+                self.block_crc64 = 0
+                self.block_sha256 = hashlib.sha256() if self.check_type == 10 else None
+                self.block_uncomp_bytes = 0
+                self.compressed_bytes_in_block = 0
+                self.in_chunk = False
+                self.phase = "CHUNKS"
 
-                            if cur_block_pos == self.block_size:
-                                committed_data = bytes(cur_block)
-                                input_h = self.input_hasher.hexdigest()[:16]
-                                self.history.append_block(committed_data, block_idx, input_h)
-                                self.history.checkpoint(block_idx, {"block_idx": block_idx}, input_h)
-                                yield ChunkOutputEvent(committed_data)
-                                yield BlockCommittedEvent(block_idx, committed_data, {})
-                                yield ProgressEvent(block_idx, len(committed_data), self.overall_output_offset)
-                                self.overall_output_offset += len(committed_data)
-                                stream_out_offset += len(committed_data)
-                                block_idx += 1
-                                cur_block_pos = 0
+            if self.phase == "CHUNKS":
+                while True:
+                    if not self.in_chunk:
+                        self.ctrl = self._read_exact(1)[0]
+                        self.compressed_bytes_in_block += 1
+                        if self.ctrl == 0:
+                            self.phase = "BLOCK_END"
+                            break
+                        elif self.ctrl in (1, 2):
+                            if self.ctrl == 1:
+                                self.history.reset()
+                                self.reps = [0, 0, 0, 0]
+                            sz_b = self._read_exact(2)
+                            self.compressed_bytes_in_block += 2
+                            csz = ((sz_b[0] << 8) | sz_b[1]) + 1
+                            self.raw_chunk = self._read_exact(csz)
+                            self.compressed_bytes_in_block += csz
+                            self.raw_pos = 0
+                            self.in_chunk = True
+                        elif self.ctrl >= 0x80:
+                            self.mode = (self.ctrl >> 5) & 3
+                            uh = (self.ctrl & 0x1F) << 16
+                            s12 = self._read_exact(2)
+                            s34 = self._read_exact(2)
+                            self.compressed_bytes_in_block += 4
+                            self.chunk_uncomp_sz = (uh | (s12[0] << 8) | s12[1]) + 1
+                            self.chunk_comp_sz = ((s34[0] << 8) | s34[1]) + 1
+                            if self.mode >= 1:
+                                self.state = 0
+                                self._reinit_probs()
+                            if self.mode >= 2:
+                                pbyte = self._read_exact(1)[0]
+                                self.compressed_bytes_in_block += 1
+                                self.pb = pbyte // 45
+                                rem = pbyte % 45
+                                self.lp = rem // 9
+                                self.lc = rem % 9
+                                self.p_lit = [self.PROB_INIT] * (0x300 << (self.lc + self.lp))
+                            if self.mode == 3:
+                                self.history.reset()
+                                self.reps = [0, 0, 0, 0]
+                            self.chunk_compressed = self._read_exact(self.chunk_comp_sz)
+                            self.compressed_bytes_in_block += self.chunk_comp_sz
+                            c_off = 0
+                            def _get_b():
+                                nonlocal c_off
+                                if c_off < len(self.chunk_compressed):
+                                    b = self.chunk_compressed[c_off]; c_off += 1; return b
+                                return 0
+                            rd_init = RangeDecoder(_get_b, init_stream=True)
+                            self.rd_code = rd_init.code
+                            self.rd_range = rd_init.range
+                            self.comp_offset = c_off
+                            self.chunk_decoded = 0
+                            self.in_chunk = True
 
-                    elif ctrl >= 0x80:
-                        # LZMA compressed chunk
-                        mode = (ctrl >> 5) & 3
-                        uncomp_high = (ctrl & 0x1F) << 16
-                        sz1_2 = self._read_exact(2)
-                        sz3_4 = self._read_exact(2)
-                        compressed_bytes_in_block += 4
-                        chunk_uncomp_sz = (uncomp_high | (sz1_2[0] << 8) | sz1_2[1]) + 1
-                        chunk_comp_sz = ((sz3_4[0] << 8) | sz3_4[1]) + 1
+                    if self.ctrl in (1, 2):
+                        while self.raw_pos < len(self.raw_chunk):
+                            sp = self.block_size - self.cur_block_pos
+                            take = min(sp, len(self.raw_chunk) - self.raw_pos)
+                            self.cur_block[self.cur_block_pos : self.cur_block_pos + take] = self.raw_chunk[self.raw_pos : self.raw_pos + take]
+                            self.cur_block_pos += take
+                            self.raw_pos += take
+                            if self.cur_block_pos == self.block_size:
+                                committed = bytes(self.cur_block)
+                                self._update_check(committed)
+                                self.history.append_block(committed, self.block_idx)
+                                self.overall_output_offset += len(committed)
+                                self.stream_out_offset += len(committed)
+                                self.block_idx += 1
+                                self.cur_block_pos = 0
+                                if self.raw_pos == len(self.raw_chunk):
+                                    self.in_chunk = False
+                                return committed, False
+                        self.in_chunk = False
 
-                        if mode >= 2:
-                            prop_byte = self._read_exact(1)[0]
-                            compressed_bytes_in_block += 1
-                            pb = prop_byte // 45
-                            rem = prop_byte % 45
-                            lp = rem // 9
-                            lc = rem % 9
-                            p_lit = [PROB_INIT] * (0x300 << (lc + lp))
-
-                        if mode >= 1:
-                            state = 0
-
-                        chunk_compressed = self._read_exact(chunk_comp_sz)
-                        compressed_bytes_in_block += chunk_comp_sz
-
-                        comp_offset = 0
-                        def _get_comp_byte():
-                            nonlocal comp_offset
-                            if comp_offset < len(chunk_compressed):
-                                b = chunk_compressed[comp_offset]
-                                comp_offset += 1
-                                return b
+                    elif self.ctrl >= 0x80:
+                        c_off = self.comp_offset
+                        comp_bytes = self.chunk_compressed
+                        def _rd_get():
+                            nonlocal c_off
+                            if c_off < len(comp_bytes):
+                                b = comp_bytes[c_off]; c_off += 1; return b
                             return 0
+                        rd = RangeDecoder(_rd_get, init_stream=False)
+                        rd.code = self.rd_code
+                        rd.range = self.rd_range
 
-                        rd = RangeDecoder(_get_comp_byte)
+                        pos_mask = (1 << self.pb) - 1
+                        lp_mask = (1 << self.lp) - 1
 
-                        pos_mask = (1 << pb) - 1
-                        lp_mask = (1 << lp) - 1
-                        chunk_decoded = 0
-
-                        while chunk_decoded < chunk_uncomp_sz:
-                            pos_state = (stream_out_offset + cur_block_pos) & pos_mask
-                            match_idx = (state << 4) + pos_state
-
-                            if rd.decode_bit(p_is_match, match_idx) == 0:
-                                # Literal
-                                if cur_block_pos > 0:
-                                    prev_byte = cur_block[cur_block_pos - 1]
-                                else:
-                                    prev_slice = self.history.get_history_slice(1, 1)
-                                    prev_byte = prev_slice[0] if prev_slice else 0
-
-                                lit_state = (((stream_out_offset + cur_block_pos) & lp_mask) << lc) + (prev_byte >> (8 - lc))
-                                lit_offset = lit_state * 0x300
-
-                                symbol = 1
-                                if state >= 7:
-                                    dist = reps[0]
-                                    if dist < cur_block_pos:
-                                        match_byte = cur_block[cur_block_pos - 1 - dist]
+                        while self.chunk_decoded < self.chunk_uncomp_sz:
+                            if self.in_match_copy:
+                                dist = self.match_dist
+                                while self.match_rem > 0:
+                                    sp = self.block_size - self.cur_block_pos
+                                    copy_len = min(sp, self.match_rem)
+                                    if dist < self.cur_block_pos:
+                                        src_s = self.cur_block_pos - 1 - dist
+                                        if dist == 0:
+                                            self.cur_block[self.cur_block_pos : self.cur_block_pos + copy_len] = bytes([self.cur_block[src_s]]) * copy_len
+                                        elif dist >= copy_len:
+                                            self.cur_block[self.cur_block_pos : self.cur_block_pos + copy_len] = self.cur_block[src_s : src_s + copy_len]
+                                        else:
+                                            for i in range(copy_len):
+                                                self.cur_block[self.cur_block_pos + i] = self.cur_block[src_s + i]
                                     else:
-                                        m_slice = self.history.get_history_slice(dist - cur_block_pos + 1, 1)
-                                        match_byte = m_slice[0] if m_slice else 0
+                                        h_dist = dist - self.cur_block_pos + 1
+                                        h_req = min(copy_len, h_dist)
+                                        hs = self.history.get_history_slice(h_dist, h_req)
+                                        self.cur_block[self.cur_block_pos : self.cur_block_pos + len(hs)] = hs
+                                        cpd = len(hs)
+                                        if cpd < copy_len:
+                                            for i in range(copy_len - cpd):
+                                                self.cur_block[self.cur_block_pos + cpd + i] = self.cur_block[i]
+                                    self.cur_block_pos += copy_len
+                                    self.chunk_decoded += copy_len
+                                    self.match_rem -= copy_len
+                                    if self.cur_block_pos == self.block_size:
+                                        committed = bytes(self.cur_block)
+                                        self._update_check(committed)
+                                        self.history.append_block(committed, self.block_idx)
+                                        self.overall_output_offset += len(committed)
+                                        self.stream_out_offset += len(committed)
+                                        self.block_idx += 1
+                                        self.cur_block_pos = 0
+                                        self.rd_code = rd.code
+                                        self.rd_range = rd.range
+                                        self.comp_offset = c_off
+                                        if self.match_rem == 0:
+                                            self.in_match_copy = False
+                                        return committed, False
+                                self.in_match_copy = False
 
+                            pos_state = (self.stream_out_offset + self.cur_block_pos) & pos_mask
+                            match_idx = (self.state << 4) + pos_state
+                            if rd.decode_bit(self.p_is_match, match_idx) == 0:
+                                if self.cur_block_pos > 0:
+                                    prev_b = self.cur_block[self.cur_block_pos - 1]
+                                else:
+                                    ps = self.history.get_history_slice(1, 1)
+                                    prev_b = ps[0] if ps else 0
+                                lit_st = (((self.stream_out_offset + self.cur_block_pos) & lp_mask) << self.lc) + (prev_b >> (8 - self.lc))
+                                lit_off = lit_st * 0x300
+                                symbol = 1
+                                if self.state >= 7:
+                                    dist = self.reps[0]
+                                    if dist < self.cur_block_pos:
+                                        mb = self.cur_block[self.cur_block_pos - 1 - dist]
+                                    else:
+                                        ms = self.history.get_history_slice(dist - self.cur_block_pos + 1, 1)
+                                        mb = ms[0] if ms else 0
                                     while symbol < 0x100:
-                                        match_bit = (match_byte >> 7) & 1
-                                        match_byte = (match_byte << 1) & 0xFF
-                                        bit = rd.decode_bit(p_lit, lit_offset + ((1 + match_bit) << 8) + symbol)
+                                        mbit = (mb >> 7) & 1
+                                        mb = (mb << 1) & 0xFF
+                                        bit = rd.decode_bit(self.p_lit, lit_off + ((1 + mbit) << 8) + symbol)
                                         symbol = (symbol << 1) | bit
-                                        if match_bit != bit:
-                                            break
+                                        if mbit != bit: break
                                 while symbol < 0x100:
-                                    symbol = (symbol << 1) | rd.decode_bit(p_lit, lit_offset + symbol)
+                                    symbol = (symbol << 1) | rd.decode_bit(self.p_lit, lit_off + symbol)
+                                self.cur_block[self.cur_block_pos] = symbol - 0x100
+                                self.cur_block_pos += 1
+                                self.chunk_decoded += 1
+                                self.state = [0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5][self.state]
 
-                                cur_block[cur_block_pos] = symbol - 0x100
-                                cur_block_pos += 1
-                                chunk_decoded += 1
-                                state = [0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 4, 5][state]
-
+                                if self.cur_block_pos == self.block_size:
+                                    committed = bytes(self.cur_block)
+                                    self._update_check(committed)
+                                    self.history.append_block(committed, self.block_idx)
+                                    self.overall_output_offset += len(committed)
+                                    self.stream_out_offset += len(committed)
+                                    self.block_idx += 1
+                                    self.cur_block_pos = 0
+                                    self.rd_code = rd.code
+                                    self.rd_range = rd.range
+                                    self.comp_offset = c_off
+                                    if self.chunk_decoded == self.chunk_uncomp_sz:
+                                        self.in_chunk = False
+                                    return committed, False
                             else:
-                                # Match
-                                if rd.decode_bit(p_is_rep, state) == 1:
-                                    if rd.decode_bit(p_is_rep_g0, state) == 0:
-                                        if rd.decode_bit(p_is_rep0_long, match_idx) == 0:
-                                            # Short rep
-                                            state = 9 if state < 7 else 11
+                                if rd.decode_bit(self.p_is_rep, self.state) == 1:
+                                    if rd.decode_bit(self.p_is_rep_g0, self.state) == 0:
+                                        if rd.decode_bit(self.p_is_rep0_long, match_idx) == 0:
+                                            self.state = 9 if self.state < 7 else 11
                                             length = 1
-                                            dist = reps[0]
-                                            if dist < cur_block_pos:
-                                                cur_block[cur_block_pos] = cur_block[cur_block_pos - 1 - dist]
+                                            dist = self.reps[0]
+                                            if dist < self.cur_block_pos:
+                                                self.cur_block[self.cur_block_pos] = self.cur_block[self.cur_block_pos - 1 - dist]
                                             else:
-                                                m_slice = self.history.get_history_slice(dist - cur_block_pos + 1, 1)
-                                                cur_block[cur_block_pos] = m_slice[0] if m_slice else 0
-                                            cur_block_pos += 1
-                                            chunk_decoded += 1
-
-                                            if cur_block_pos == self.block_size:
-                                                committed_data = bytes(cur_block)
-                                                input_h = self.input_hasher.hexdigest()[:16]
-                                                self.history.append_block(committed_data, block_idx, input_h)
-                                                self.history.checkpoint(block_idx, {"block_idx": block_idx}, input_h)
-                                                yield ChunkOutputEvent(committed_data)
-                                                yield BlockCommittedEvent(block_idx, committed_data, {})
-                                                yield ProgressEvent(block_idx, len(committed_data), self.overall_output_offset)
-                                                self.overall_output_offset += len(committed_data)
-                                                stream_out_offset += len(committed_data)
-                                                block_idx += 1
-                                                cur_block_pos = 0
+                                                ms = self.history.get_history_slice(dist - self.cur_block_pos + 1, 1)
+                                                self.cur_block[self.cur_block_pos] = ms[0] if ms else 0
+                                            self.cur_block_pos += 1
+                                            self.chunk_decoded += 1
+                                            if self.cur_block_pos == self.block_size:
+                                                committed = bytes(self.cur_block)
+                                                self._update_check(committed)
+                                                self.history.append_block(committed, self.block_idx)
+                                                self.overall_output_offset += len(committed)
+                                                self.stream_out_offset += len(committed)
+                                                self.block_idx += 1
+                                                self.cur_block_pos = 0
+                                                self.rd_code = rd.code
+                                                self.rd_range = rd.range
+                                                self.comp_offset = c_off
+                                                if self.chunk_decoded == self.chunk_uncomp_sz:
+                                                    self.in_chunk = False
+                                                return committed, False
                                             continue
                                     else:
-                                        if rd.decode_bit(p_is_rep_g1, state) == 0:
-                                            dist = reps[1]
+                                        if rd.decode_bit(self.p_is_rep_g1, self.state) == 0:
+                                            dist = self.reps[1]
                                         else:
-                                            if rd.decode_bit(p_is_rep_g2, state) == 0:
-                                                dist = reps[2]
+                                            if rd.decode_bit(self.p_is_rep_g2, self.state) == 0:
+                                                dist = self.reps[2]
                                             else:
-                                                dist = reps[3]
-                                                reps[3] = reps[2]
-                                            reps[2] = reps[1]
-                                        reps[1] = reps[0]
-                                        reps[0] = dist
-                                    length = 2 + decode_len_val(rd, p_rep_len, pos_state)
-                                    state = 8 if state < 7 else 11
+                                                dist = self.reps[3]
+                                                self.reps[3] = self.reps[2]
+                                            self.reps[2] = self.reps[1]
+                                        self.reps[1] = self.reps[0]
+                                        self.reps[0] = dist
+                                    length = 2 + decode_len_val(rd, self.p_rep_len, pos_state)
+                                    self.state = 8 if self.state < 7 else 11
                                 else:
-                                    reps[3] = reps[2]
-                                    reps[2] = reps[1]
-                                    reps[1] = reps[0]
-                                    state = 7 if state < 7 else 10
-                                    length = 2 + decode_len_val(rd, p_len, pos_state)
-                                    len_state = min(length - 2, 3)
-                                    slot = rd.decode_bittree(p_pos_slot, len_state << 6, 6)
+                                    self.reps[3] = self.reps[2]
+                                    self.reps[2] = self.reps[1]
+                                    self.reps[1] = self.reps[0]
+                                    self.state = 7 if self.state < 7 else 10
+                                    length = 2 + decode_len_val(rd, self.p_len, pos_state)
+                                    l_st = min(length - 2, 3)
+                                    slot = rd.decode_bittree(self.p_pos_slot, l_st << 6, 6)
                                     if slot < 4:
                                         dist = slot
                                     else:
-                                        num_direct_bits = (slot >> 1) - 1
-                                        base = (2 | (slot & 1)) << num_direct_bits
+                                        nd = (slot >> 1) - 1
+                                        base = (2 | (slot & 1)) << nd
                                         if slot < 14:
-                                            dist = base + rd.decode_reverse_bittree(p_spec_pos, base - slot, num_direct_bits)
+                                            dist = base + rd.decode_reverse_bittree(self.p_spec_pos, base - slot, nd)
                                         else:
-                                            d_bits = rd.decode_direct_bits(num_direct_bits - 4) << 4
-                                            a_bits = rd.decode_reverse_bittree(p_align, 0, 4)
-                                            dist = base + d_bits + a_bits
-                                    reps[0] = dist
+                                            db = rd.decode_direct_bits(nd - 4) << 4
+                                            ab = rd.decode_reverse_bittree(self.p_align, 0, 4)
+                                            dist = base + db + ab
+                                    self.reps[0] = dist
 
-                                # Match copy loop
-                                dist = reps[0]
-                                rem_to_copy = length
-                                while rem_to_copy > 0:
-                                    space = self.block_size - cur_block_pos
-                                    copy_len = min(space, rem_to_copy)
-
-                                    if dist < cur_block_pos:
-                                        src_start = cur_block_pos - 1 - dist
+                                self.in_match_copy = True
+                                self.match_dist = dist
+                                self.match_rem = length
+                                while self.match_rem > 0:
+                                    sp = self.block_size - self.cur_block_pos
+                                    copy_len = min(sp, self.match_rem)
+                                    if dist < self.cur_block_pos:
+                                        src_s = self.cur_block_pos - 1 - dist
                                         if dist == 0:
-                                            cur_block[cur_block_pos : cur_block_pos + copy_len] = bytes([cur_block[src_start]]) * copy_len
+                                            self.cur_block[self.cur_block_pos : self.cur_block_pos + copy_len] = bytes([self.cur_block[src_s]]) * copy_len
                                         elif dist >= copy_len:
-                                            cur_block[cur_block_pos : cur_block_pos + copy_len] = cur_block[src_start : src_start + copy_len]
+                                            self.cur_block[self.cur_block_pos : self.cur_block_pos + copy_len] = self.cur_block[src_s : src_s + copy_len]
                                         else:
                                             for i in range(copy_len):
-                                                cur_block[cur_block_pos + i] = cur_block[src_start + i]
+                                                self.cur_block[self.cur_block_pos + i] = self.cur_block[src_s + i]
                                     else:
-                                        hist_needed = min(copy_len, dist - cur_block_pos + 1)
-                                        h_slice = self.history.get_history_slice(dist - cur_block_pos + 1, hist_needed)
-                                        cur_block[cur_block_pos : cur_block_pos + len(h_slice)] = h_slice
-                                        copied = len(h_slice)
-                                        if copied < copy_len:
-                                            for i in range(copy_len - copied):
-                                                cur_block[cur_block_pos + copied + i] = cur_block[cur_block_pos + i]
+                                        h_dist = dist - self.cur_block_pos + 1
+                                        h_req = min(copy_len, h_dist)
+                                        hs = self.history.get_history_slice(h_dist, h_req)
+                                        self.cur_block[self.cur_block_pos : self.cur_block_pos + len(hs)] = hs
+                                        cpd = len(hs)
+                                        if cpd < copy_len:
+                                            for i in range(copy_len - cpd):
+                                                self.cur_block[self.cur_block_pos + cpd + i] = self.cur_block[i]
+                                    self.cur_block_pos += copy_len
+                                    self.chunk_decoded += copy_len
+                                    self.match_rem -= copy_len
+                                    if self.cur_block_pos == self.block_size:
+                                        committed = bytes(self.cur_block)
+                                        self._update_check(committed)
+                                        self.history.append_block(committed, self.block_idx)
+                                        self.overall_output_offset += len(committed)
+                                        self.stream_out_offset += len(committed)
+                                        self.block_idx += 1
+                                        self.cur_block_pos = 0
+                                        self.rd_code = rd.code
+                                        self.rd_range = rd.range
+                                        self.comp_offset = c_off
+                                        if self.match_rem == 0:
+                                            self.in_match_copy = False
+                                        return committed, False
+                                self.in_match_copy = False
 
-                                    cur_block_pos += copy_len
-                                    chunk_decoded += copy_len
-                                    rem_to_copy -= copy_len
+                        self.in_chunk = False
+                        self.rd_code = rd.code
+                        self.rd_range = rd.range
+                        self.comp_offset = c_off
 
-                                    if cur_block_pos == self.block_size:
-                                        committed_data = bytes(cur_block)
-                                        input_h = self.input_hasher.hexdigest()[:16]
-                                        self.history.append_block(committed_data, block_idx, input_h)
-                                        self.history.checkpoint(block_idx, {"block_idx": block_idx}, input_h)
-                                        yield ChunkOutputEvent(committed_data)
-                                        yield BlockCommittedEvent(block_idx, committed_data, {})
-                                        yield ProgressEvent(block_idx, len(committed_data), self.overall_output_offset)
-                                        self.overall_output_offset += len(committed_data)
-                                        stream_out_offset += len(committed_data)
-                                        block_idx += 1
-                                        cur_block_pos = 0
+            if self.phase == "BLOCK_END":
+                if self.cur_block_pos > 0:
+                    partial = bytes(self.cur_block[:self.cur_block_pos])
+                    self._update_check(partial)
+                    self.history.append_block(partial, self.block_idx)
+                    self.overall_output_offset += len(partial)
+                    self.stream_out_offset += len(partial)
+                    self.block_idx += 1
+                    self.cur_block_pos = 0
+                    return partial, False
 
-                            if cur_block_pos == self.block_size:
-                                committed_data = bytes(cur_block)
-                                input_h = self.input_hasher.hexdigest()[:16]
-                                self.history.append_block(committed_data, block_idx, input_h)
-                                self.history.checkpoint(block_idx, {"block_idx": block_idx}, input_h)
-                                yield ChunkOutputEvent(committed_data)
-                                yield BlockCommittedEvent(block_idx, committed_data, {})
-                                yield ProgressEvent(block_idx, len(committed_data), self.overall_output_offset)
-                                self.overall_output_offset += len(committed_data)
-                                stream_out_offset += len(committed_data)
-                                block_idx += 1
-                                cur_block_pos = 0
+                if self.expected_comp_size is not None and self.compressed_bytes_in_block != self.expected_comp_size:
+                    raise XZFormatError("Block compressed size mismatch")
+                if self.expected_uncomp_size is not None and self.block_uncomp_bytes != self.expected_uncomp_size:
+                    raise XZFormatError("Block uncompressed size mismatch")
 
-                # Block padding
-                pad_len = (4 - (compressed_bytes_in_block % 4)) % 4
+                pad_len = (4 - (self.compressed_bytes_in_block % 4)) % 4
                 if pad_len > 0:
                     self._read_exact(pad_len)
+                chk_sz = {0: 0, 1: 4, 4: 8, 10: 32}.get(self.check_type, 0)
+                if chk_sz > 0:
+                    chk_b = self._read_exact(chk_sz)
+                    if self.check_type == 1:
+                        if self.block_crc32 != struct.unpack("<I", chk_b)[0]:
+                            raise XZCheckError("Block CRC32 mismatch")
+                    elif self.check_type == 4:
+                        if self.block_crc64 != struct.unpack("<Q", chk_b)[0]:
+                            raise XZCheckError("Block CRC64 mismatch")
+                    elif self.check_type == 10:
+                        if self.block_sha256.digest() != chk_b:
+                            raise XZCheckError("Block SHA-256 mismatch")
+                unpad_sz = self.bh_size + self.compressed_bytes_in_block + chk_sz
+                self.stream_block_records.append((unpad_sz, self.block_uncomp_bytes))
+                self.phase = "BLOCK_START"
 
-                # Block Check (CRC32=4, CRC64=8, SHA256=32)
-                check_size = {0: 0, 1: 4, 4: 8, 10: 32}.get(check_type, 0)
-                if check_size > 0:
-                    self._read_exact(check_size)
+            if self.phase == "INDEX":
+                idx_b = bytearray([0x00])
+                def _vli():
+                    val = 0; s = 0
+                    for _ in range(9):
+                        b = self._read_exact(1)[0]; idx_b.append(b)
+                        val |= (b & 0x7F) << s
+                        if (b & 0x80) == 0: return val
+                        s += 7
+                    raise XZFormatError("Invalid VLI")
+                n_rec = _vli()
+                if n_rec != len(self.stream_block_records):
+                    raise XZFormatError("Index record mismatch")
+                for r_idx in range(n_rec):
+                    u_sz = _vli(); unc_sz = _vli()
+                    eu, eunc = self.stream_block_records[r_idx]
+                    if u_sz != eu or unc_sz != eunc:
+                        raise XZFormatError("Index record size mismatch")
+                pad = (4 - (len(idx_b) % 4)) % 4
+                if pad > 0:
+                    pb = self._read_exact(pad)
+                    idx_b.extend(pb)
+                icrc = struct.unpack("<I", self._read_exact(4))[0]
+                if crc32(idx_b) != icrc:
+                    raise XZCheckError("Index CRC mismatch")
+                self.tot_idx = len(idx_b) + 4
+                self.phase = "STREAM_FOOTER"
 
-            # Flush remaining partial block
-            if cur_block_pos > 0:
-                partial_data = bytes(cur_block[:cur_block_pos])
-                input_h = self.input_hasher.hexdigest()[:16]
-                self.history.append_block(partial_data, block_idx, input_h)
-                self.history.checkpoint(block_idx, {"block_idx": block_idx}, input_h)
-                yield ChunkOutputEvent(partial_data)
-                yield BlockCommittedEvent(block_idx, partial_data, {})
-                yield ProgressEvent(block_idx, len(partial_data), self.overall_output_offset)
-                self.overall_output_offset += len(partial_data)
-                block_idx += 1
-                cur_block_pos = 0
+            if self.phase == "STREAM_FOOTER":
+                footer = self._read_exact(12)
+                if not footer.endswith(b"YZ"):
+                    raise XZFormatError("Footer magic invalid")
+                if crc32(footer[4:10]) != struct.unpack("<I", footer[:4])[0]:
+                    raise XZCheckError("Footer CRC mismatch")
+                bs = struct.unpack("<I", footer[4:8])[0]
+                if self.tot_idx != (bs + 1) * 4:
+                    raise XZFormatError("Backward size mismatch")
+                if footer[8:10] != self.flags:
+                    raise XZFormatError("Footer flags mismatch")
+                self.pending_boundary = StreamBoundaryEvent(
+                    stream_index=self.stream_index,
+                    next_stream_index=self.stream_index + 1,
+                    input_stream_len=self.overall_input_offset - self.stream_start_in,
+                    overall_input_offset=self.overall_input_offset,
+                    output_stream_len=self.overall_output_offset - self.stream_start_out,
+                    overall_output_offset=self.overall_output_offset
+                )
+                self.stream_index += 1
+                self.phase = "STREAM_PADDING"
+                self.null_count = 0
 
-            # Read Index field (Indicator 0x00 already read)
-            index_bytes_count = 1
-            def _vli_with_count():
-                nonlocal index_bytes_count
-                val = 0
-                shift = 0
-                for _ in range(9):
-                    b = self._read_exact(1)[0]
-                    index_bytes_count += 1
-                    val |= (b & 0x7F) << shift
-                    if (b & 0x80) == 0:
-                        return val
-                    shift += 7
-                raise ValueError("Invalid VLI in Index")
+            if self.phase == "STREAM_PADDING":
+                self.phase = "STREAM_HEADER"
 
-            num_records = _vli_with_count()
-            for _ in range(num_records):
-                _vli_with_count()
-                _vli_with_count()
+    def decode_events(self):
+        while True:
+            blk, is_eof = self.decode_block()
+            if blk:
+                yield ChunkOutputEvent(blk)
+                yield BlockCommittedEvent(self.block_idx - 1, blk, self.export_state())
+                yield ProgressEvent(self.block_idx - 1, len(blk), self.overall_output_offset)
+            if self.pending_boundary:
+                yield self.pending_boundary
+                self.pending_boundary = None
+            if is_eof:
+                break
 
-            # Index padding to 4-byte boundary
-            idx_pad = (4 - (index_bytes_count % 4)) % 4
-            if idx_pad > 0:
-                self._read_exact(idx_pad)
-
-            # Index CRC32 (4 bytes)
-            self._read_exact(4)
-
-            # Stream Footer (12 bytes)
-            footer = self._read_exact(12)
-            if not footer.endswith(b"YZ"):
-                raise ValueError(f"Invalid Stream Footer magic: {footer[-2:].hex()}")
-
-            stream_end_in = self.overall_input_offset
-            stream_end_out = self.overall_output_offset
-            in_len = stream_end_in - stream_start_in
-            out_len = stream_end_out - stream_start_out
-
-            yield StreamBoundaryEvent(
-                stream_index=stream_index,
-                next_stream_index=stream_index + 1,
-                input_stream_len=in_len,
-                overall_input_offset=stream_end_in,
-                output_stream_len=out_len,
-                overall_output_offset=stream_end_out
-            )
-            stream_index += 1
-
-# --- Standalone CLI Driver ---
 
 def compute_output_filename(input_path):
     if input_path == "-":
@@ -1287,6 +1600,202 @@ class TestXZDecompressor(unittest.TestCase):
         # Timeout after 0.01 seconds
         with self.assertRaises(WallClockTimeout):
             decompress_xz(io.BytesIO(xz_data), output_target="-", timeout=0.01, cpu_timeout=0)
+
+
+    def test_interleaved_resumption_with_serialized_state(self):
+        lzma = self.lzma
+        import random, io, json
+        prng_a = random.Random(42)
+        prng_b = random.Random(1337)
+
+        raw_a = bytearray()
+        for _ in range(200):
+            raw_a.extend(prng_a.randbytes(500))
+            raw_a.extend(b"REPETITIVE_PATTERN_ALPHA_" * 20)
+        raw_a = bytes(raw_a)
+
+        raw_b = bytearray()
+        for _ in range(200):
+            raw_b.extend(prng_b.randbytes(500))
+            raw_b.extend(b"REPETITIVE_PATTERN_BETA__" * 20)
+        raw_b = bytes(raw_b)
+
+        xz_a = lzma.compress(raw_a, preset=9 | lzma.PRESET_EXTREME)
+        xz_b = lzma.compress(raw_b, preset=1)
+
+        stream_a_io = io.BytesIO(xz_a)
+        stream_b_io = io.BytesIO(xz_b)
+
+        state_a = None
+        state_b = None
+        eof_a = False
+        eof_b = False
+        out_a = bytearray()
+        out_b = bytearray()
+
+        round_num = 0
+        while not (eof_a and eof_b):
+            round_num += 1
+            if not eof_a:
+                engine_a = XZStreamDecompressor(stream_a_io)
+                if state_a is not None:
+                    engine_a.import_state(state_a)
+                blk_a, eof_a = engine_a.decode_block()
+                if blk_a:
+                    out_a.extend(blk_a)
+                state_a_json = json.dumps(engine_a.export_state())
+                del engine_a
+                state_a = json.loads(state_a_json)
+
+            if not eof_b:
+                engine_b = XZStreamDecompressor(stream_b_io)
+                if state_b is not None:
+                    engine_b.import_state(state_b)
+                blk_b, eof_b = engine_b.decode_block()
+                if blk_b:
+                    out_b.extend(blk_b)
+                state_b_json = json.dumps(engine_b.export_state())
+                del engine_b
+                state_b = json.loads(state_b_json)
+
+        self.assertEqual(bytes(out_a), raw_a)
+        self.assertEqual(bytes(out_b), raw_b)
+        self.assertGreater(round_num, 3)
+
+    def test_block_header_parsing_and_filter_properties(self):
+        lzma = self.lzma
+        import io
+        data = b"BLOCK_HEADER_FILTER_PROP_TEST_" * 30
+        for preset in [0, 1, 6]:
+            xz_data = lzma.compress(data, preset=preset)
+            engine = XZStreamDecompressor(io.BytesIO(xz_data))
+            out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+            self.assertEqual(out, data)
+
+        xz_tampered = bytearray(lzma.compress(data))
+        xz_tampered[13] = 0x01
+        h_sz = (xz_tampered[12] + 1) * 4
+        h_crc = crc32(xz_tampered[12 : 12 + h_sz - 4])
+        xz_tampered[12 + h_sz - 4 : 12 + h_sz] = struct.pack("<I", h_crc)
+        with self.assertRaises(XZUnsupportedError):
+            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_tampered)))
+            list(engine.decode_events())
+
+    def test_block_checks_and_corruption_detection(self):
+        lzma = self.lzma
+        import io
+        data = b"CORRUPTION_INTEGRITY_CHECK_TEST_" * 40
+        for chk in [lzma.CHECK_CRC32, lzma.CHECK_CRC64, lzma.CHECK_SHA256, lzma.CHECK_NONE]:
+            xz_data = lzma.compress(data, check=chk)
+            engine = XZStreamDecompressor(io.BytesIO(xz_data))
+            out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+            self.assertEqual(out, data)
+
+        xz_data_crc = bytearray(lzma.compress(data, check=lzma.CHECK_CRC32))
+        xz_data_crc[-25] ^= 0x55
+        with self.assertRaises((XZCheckError, XZFormatError, ValueError)):
+            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_data_crc)))
+            list(engine.decode_events())
+
+    def test_rfc212_stream_padding_alignment(self):
+        lzma = self.lzma
+        import io
+        data = b"PADDING_ALIGNMENT_TEST_" * 20
+        xz1 = lzma.compress(data)
+        xz2 = lzma.compress(data)
+
+        for valid_pad in [0, 4, 8]:
+            stream = xz1 + (b"\x00" * valid_pad) + xz2
+            engine = XZStreamDecompressor(io.BytesIO(stream))
+            out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+            self.assertEqual(out, data + data)
+
+        for invalid_pad in [1, 2, 3]:
+            stream = xz1 + (b"\x00" * invalid_pad) + xz2
+            with self.assertRaises(XZFormatError):
+                engine = XZStreamDecompressor(io.BytesIO(stream))
+                list(engine.decode_events())
+
+    def test_multiblock_and_lzma2_resets(self):
+        import io
+        b1_data = b"BLOCK_ONE_TEST_STRING_12345" * 10
+        b2_data = b"BLOCK_TWO_TEST_STRING_67890" * 10
+
+        def encode_vli(val):
+            res = bytearray()
+            while val >= 0x80:
+                res.append((val & 0x7F) | 0x80)
+                val >>= 7
+            res.append(val & 0x7F)
+            return bytes(res)
+
+        def make_uncomp_chunk(data, reset=True):
+            ctrl = 0x01 if reset else 0x02
+            sz = len(data) - 1
+            return bytes([ctrl, (sz >> 8) & 0xFF, sz & 0xFF]) + data + b"\x00"
+
+        def build_multiblock(blocks, check_type=4):
+            stream_flags = bytes([0x00, check_type & 0x0F])
+            header = b"\xfd7zXZ\x00" + stream_flags + struct.pack("<I", crc32(stream_flags))
+            stream_body = bytearray()
+            index_records = []
+            for uncomp_data, comp_payload in blocks:
+                bh_inner = bytearray([0x00])
+                bh_inner.extend(encode_vli(0x21))
+                bh_inner.extend(encode_vli(1))
+                bh_inner.append(22)
+                target_len = ((len(bh_inner) + 1 + 4 + 3) // 4) * 4
+                pad_needed = target_len - (len(bh_inner) + 1 + 4)
+                bh_inner.extend(b"\x00" * pad_needed)
+                first_byte = (target_len // 4) - 1
+                bh_no_crc = bytes([first_byte]) + bytes(bh_inner)
+                bh = bh_no_crc + struct.pack("<I", crc32(bh_no_crc))
+                block_pad_len = (4 - (len(comp_payload) % 4)) % 4
+                block_pad = b"\x00" * block_pad_len
+                check_bytes = struct.pack("<Q", crc64(uncomp_data))
+                stream_body.extend(bh + comp_payload + block_pad + check_bytes)
+                unpadded_size = len(bh) + len(comp_payload) + len(check_bytes)
+                index_records.append((unpadded_size, len(uncomp_data)))
+            idx_body = bytearray([0x00])
+            idx_body.extend(encode_vli(len(index_records)))
+            for u_sz, unc_sz in index_records:
+                idx_body.extend(encode_vli(u_sz))
+                idx_body.extend(encode_vli(unc_sz))
+            idx_pad_len = (4 - (len(idx_body) % 4)) % 4
+            idx_body.extend(b"\x00" * idx_pad_len)
+            idx_bytes = bytes(idx_body) + struct.pack("<I", crc32(idx_body))
+            backward_size = (len(idx_bytes) // 4) - 1
+            footer_mid = struct.pack("<I", backward_size) + stream_flags
+            footer = struct.pack("<I", crc32(footer_mid)) + footer_mid + b"YZ"
+            return header + bytes(stream_body) + idx_bytes + footer
+
+        c1 = make_uncomp_chunk(b1_data, reset=True)
+        c2 = make_uncomp_chunk(b2_data, reset=True)
+        stream = build_multiblock([(b1_data, c1), (b2_data, c2)], check_type=4)
+
+        engine = XZStreamDecompressor(io.BytesIO(stream))
+        out = b"".join(ev.data for ev in engine.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT)
+        self.assertEqual(out, b1_data + b2_data)
+
+    def test_index_and_stream_footer_integrity(self):
+        lzma = self.lzma
+        import io
+        data = b"INDEX_FOOTER_INTEGRITY_" * 50
+        xz_data = bytearray(lzma.compress(data))
+
+        xz_bad_footer = bytearray(xz_data)
+        xz_bad_footer[-12] ^= 0xFF
+        with self.assertRaises(XZCheckError):
+            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_bad_footer)))
+            list(engine.decode_events())
+
+        xz_bad_bs = bytearray(xz_data)
+        xz_bad_bs[-8] ^= 0x01
+        new_mid = xz_bad_bs[-8:-2]
+        xz_bad_bs[-12:-8] = struct.pack("<I", crc32(new_mid))
+        with self.assertRaises(XZFormatError):
+            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_bad_bs)))
+            list(engine.decode_events())
 
 def main():
     parser = argparse.ArgumentParser(description="Universal Pure-Python Resumable XZ / LZMA2 Decompressor")
