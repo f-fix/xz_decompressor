@@ -3,7 +3,7 @@ Pure-Python XZ / LZMA2 Streaming Decompressor with Resumption
 
 Target Environments: MicroPython, PyPy 3, CPython 3.8+  
 Authoritative Standard: The .xz File Format Specification (v1.2.0 / RFC §2 & §3)  
-Revision: 7 (Match-execution invariants, page-based history store, stream-event ordering, checkpoint-based resumption, strict LZMA2 validation, regression-test requirements; see Appendix A)
+Revision: 8 (LZMA_Alone (.lzma) container specification, pb=4 514-entry length-coder invariant, strict header validation, EOF/trailing-byte integrity rules, and runtime-adaptive feature documentation; see Appendix A)
 
 ---
 
@@ -13,9 +13,9 @@ This specification defines the architecture, wire protocols, integrity verificat
 
 ### 1.1 Wire Format Scope & Boundaries
 - **Supported Primary Container**: The .xz File Format Specification (v1.2.0 / RFC §2 & §3), supporting multi-stream concatenation, variable null padding, and arbitrary multi-block structures. Each Stream is parsed independently (its Check type may differ from other Streams in the same file).
-- **Supported Filter**: LZMA2 (`Filter ID 0x21`) with arbitrary dictionary sizes up to 64 MiB of *usable* history (see §2.2 item 4 for larger declared sizes).
+- **Supported Legacy Container (`.lzma`)**: The legacy 13-byte raw LZMA header format (LZMA_Alone) is fully supported, including independent and concatenated / intermixed XZ/LZMA streams (see §5.5). Non-XZ/non-LZMA input raises `E_FORMAT`.
+- **Supported Filters**: LZMA2 (`Filter ID 0x21`) and raw LZMA1 (in `.lzma` containers) with arbitrary dictionary sizes up to 64 MiB of *usable* history (see §2.2 item 4 for larger declared sizes).
 - **Supported Check IDs**: `0x00` None, `0x01` CRC32, `0x04` CRC64, `0x0A` SHA-256. All other IDs raise `E_UNSUPPORTED`.
-- **Unsupported Legacy Container (`.lzma`)**: The legacy 13-byte raw LZMA header format (LZMA_Alone) is **not** supported. Filename convenience mappings accept `.lzma` input paths solely for CLI compatibility, but the input must be a valid XZ container. Non-XZ input raises `E_FORMAT` upon invalid Stream magic.
 - **Unsupported Secondary Filters**: BCJ (`0x04`–`0x0B`) and Delta (`0x03`) are not included. Blocks with filter count > 1 or a non-LZMA2 filter ID are rejected with `E_UNSUPPORTED` before any output is produced for that Block.
 - **Out of Scope**: random-access decoding via the Index, multithreaded decoding, and `.lz`/`.zst` containers.
 
@@ -251,7 +251,7 @@ In concatenated multi-stream archives, `--resume-from` is valid when aligned to 
 
 ### 4.2 Dual-Layer Enforcement Mechanism
 - **Preemptive signals**: `SIGALRM` via `setitimer(ITIMER_REAL)`/`alarm` (wall) and `SIGVTALRM` via `setitimer(ITIMER_VIRTUAL)` (CPU), where available. Platforms without them (Windows, MicroPython, non-main threads) skip registration silently.
-- **Cooperative checks** (all platforms): evaluated on every decompressor event and at least once per committed block, with a margin of ~150 ms (`elapsed >= timeout - 0.15`). On a cooperative trigger the driver writes the mandatory checkpoint (§3.3.5), preserves `.part` files, prints the resume message, and exits 124 before an external supervisor can kill the process.
+- **Cooperative checks** (all platforms): evaluated on committed block boundaries, with a proportional margin (`coop_margin = min(0.15, timeout_sec * 0.10)`), defaulting to 150 ms for production runs while scaling down for sub-second timeouts to prevent starvation. On a cooperative trigger the driver writes the mandatory checkpoint (§3.3.5), preserves `.part` files, prints the resume message, and exits 124 before an external supervisor can kill the process.
 - The progress indicator (rotating ASCII glyph) is written to stderr **only when `sys.stderr.isatty()`**, so redirected logs stay clean.
 
 ### 4.3 Interruption Output & Exit Code
@@ -292,6 +292,24 @@ To resume, run with: --resume-dir=<dir> [--resume-from=<in_offset>] [--resume-at
 2. **Backward Size (4–7)**: `real_index_size = (backward_size + 1) * 4` MUST equal the actual Index size (`E_FORMAT`).
 3. **Stream Flags (8–9)**: MUST equal the Stream Header flags (`E_FORMAT`).
 4. **Magic (10–11)**: `59 5A` (`b"YZ"`).
+
+
+### 5.5 Normative Legacy LZMA_Alone (`.lzma`) Container Specification
+1. **Header Layout (13 bytes)**:
+   - **Byte 0 (Properties `p`)**: `p = (pb * 5 + lp) * 9 + lc`. MUST satisfy `p <= 224`, `pb <= 4`, `lp <= 4`, and `lc <= 8`. Note that LZMA2's `lc + lp <= 4` restriction does **not** apply to LZMA1.
+   - **Bytes 1–4 (Dictionary Size)**: 32-bit unsigned little-endian integer. Per `liblzma` specification, valid dictionary sizes MUST be `0`, `0xFFFFFFFF`, a power of 2 ($2^n$), or $2^n + 2^{n-1}$.
+   - **Bytes 5–12 (Uncompressed Size)**: 64-bit unsigned little-endian integer. Either `0xFFFFFFFFFFFFFFFF` (unknown size, indicating an End of Payload Marker / EOS symbol is mandatory) or $< 256\text{ GiB}$ ($2^{38}$ bytes).
+2. **Range Decoder First Byte**: The first byte of the compressed stream following the 13-byte header MUST be `0x00` (`E_FORMAT`).
+3. **Format Detection & Empty Input**:
+   - Format detection occurs at offset 0 before any stream padding loops. Streams starting with property byte `0x00` (`lc=0, lp=0, pb=0`) are valid and must not be swallowed as padding.
+   - Empty input (0 bytes) is not a valid container and raises `E_FORMAT` (exit 1), matching standard `xz`.
+   - Headers violating dictionary, size, or initial range-coder byte rules are rejected immediately with `E_FORMAT`.
+4. **EOF & Truncation Integrity**:
+   - For unknown-size streams, decoding MUST continue until the explicit EOS marker (`dist == 0xFFFFFFFF`). Input termination prior to the EOS marker raises `E_FORMAT` ("Unexpected EOF").
+   - For known-size streams, decoding terminates when exactly `uncompressed_size` bytes are emitted. Premature input EOF raises `E_FORMAT`.
+5. **Trailing Bytes & Multi-Stream Concatenation**:
+   - Trailing garbage or trailing null bytes following an LZMA stream without a valid following stream header are rejected with `E_FORMAT`.
+   - If followed immediately by a valid XZ stream (or XZ stream padding) or another valid LZMA stream, multi-stream decoding proceeds seamlessly.
 
 ### 5.4 Event Ordering Invariants (normative)
 1. All `CHUNK_OUTPUT` events of Stream *N* precede the `STREAM_BOUNDARY` for Stream *N*, which precedes any `CHUNK_OUTPUT` of Stream *N+1*. Drivers rely on this to route output to the correct file; an engine that emits a boundary late is non-conforming.
@@ -396,7 +414,18 @@ The built-in suite MUST be self-contained (no external files). Where the C `lzma
 
 ---
 
-## Appendix A — Changes from Revision 6
+## Appendix A — Changes from Revision 7 to Revision 8
+
+| # | Change | Reason (empirically verified against Rev 7 baseline) |
+|:---|:---|:---|
+| 1 | §2.2, §2.4: 514-entry length-coder probability tables (mid at 130 + (pos_state << 3), high at 258) | Fixes `pb=4` decoding failures in both XZ and LZMA formats (previously sized for 8 pos_states instead of 16). |
+| 2 | §5.5: Full LZMA_Alone container support & strict `liblzma` header verification | Resolves silent exit on truncated streams, overly loose format detection, and props=0x00 failure. |
+| 3 | §5.5: Mandatory EOF and truncation detection in LZMA streams | Prevents infinite zero-padding on premature input exhaustion in known-size streams. |
+| 4 | §5.5: Trailing-byte validation after `.lzma` streams | Trailing garbage or orphan null bytes rejected with `E_FORMAT`; valid concatenated XZ/LZMA streams transition cleanly. |
+| 5 | §5.5: 0-byte input rejection | Empty input raises `E_FORMAT` (exit 1), matching standard `xz` behavior. |
+| 6 | §3.2: Document `SeekableOutputFileHistory`, preflight disk check, and `_PathFallback` | Reconciles ratified specification with hardened runtime-adaptive features. |
+
+## Appendix B — Prior Changes from Revision 6
 
 | # | Change | Reason (empirically verified against the Rev 6 WIP) |
 |:---|:---|:---|

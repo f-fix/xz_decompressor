@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Resumption artifacts
+.xz_history/
+*.part
+
+# micropython
+*.mpy
