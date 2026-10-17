@@ -81,6 +81,18 @@ def _make_prob_array(count):
         return array.array("H", ba)
 
 
+def _make_lit_tables(num_tables):
+    # Preallocates num_tables sub-tables of 768 elements (1.5 KiB each).
+    # Maximum single allocation is only 1.5 KiB (1536 bytes), completely eliminating
+    # contiguous allocation failures on constrained microcontrollers down to ~24 KiB RAM!
+    return [_make_prob_array(_LIT_BASE_SIZE) for _ in range(num_tables)]
+
+
+def _reset_lit_tables(tables):
+    for sub in tables:
+        _reset_prob_array(sub)
+
+
 def _reset_prob_array(arr):
     if _IS_DESKTOP_PY and isinstance(arr, array.array):
         arr[:] = array.array("H", [1024]) * len(arr)
@@ -1741,8 +1753,10 @@ class XZStreamDecompressor:
         self.lc = 3
         self.lp = 0
         self.pb = 2
+        if _gc_mem_free is not None and _gc_mem_free() < 160 * 1024:
+            gc.collect()
+        self.p_lit = _make_lit_tables(1 << (self.lc + self.lp))
         self._reinit_probs()
-        self.p_lit = _make_prob_array(0x300 << (self.lc + self.lp))
 
         self.in_chunk = False
         self.ctrl = 0
@@ -1954,7 +1968,11 @@ class XZStreamDecompressor:
                 self.history.tail_crc32() if hasattr(self.history, "tail_crc32") else 0
             ),
             "len_pcore": sum(len(arr) * 2 for arr in self._core_prob_arrays()),
-            "len_plit": len(self.p_lit) * 2,
+            "len_plit": (
+                sum(len(sub) * 2 for sub in self.p_lit)
+                if isinstance(self.p_lit, list)
+                else len(self.p_lit) * 2
+            ),
             "len_cblk": self.cur_block_pos,
             "len_inbuf": (
                 len(self.chunk_stream_buf)
@@ -2061,9 +2079,13 @@ class XZStreamDecompressor:
         _fsync_fileobj(f_core)
         f_core.close()
 
-        # .plit (literal probability array)
+        # .plit (literal probability tables)
         f_lit = storage.open(f"{r_id}.plit", "wb")
-        f_lit.write(self.p_lit)
+        if isinstance(self.p_lit, list):
+            for sub in self.p_lit:
+                f_lit.write(sub)
+        else:
+            f_lit.write(self.p_lit)
         f_lit.flush()
         _fsync_fileobj(f_lit)
         f_lit.close()
@@ -2208,15 +2230,19 @@ class XZStreamDecompressor:
                                 raise XZResourceError(
                                     f"Corrupted plit: file size {l_sz} < recorded length {exp_plit_len}"
                                 )
-                            if (
-                                getattr(engine, "p_lit", None) is None
-                                or len(engine.p_lit) != expected_sz
+                            num_tables = 1 << (engine.lc + engine.lp)
+                            if getattr(engine, "p_lit", None) is None or (
+                                isinstance(engine.p_lit, list)
+                                and len(engine.p_lit) != num_tables
                             ):
-                                engine.p_lit = _make_prob_array(expected_sz)
-                            n = f_lit.readinto(engine.p_lit)
-                            assert (
-                                n == len(engine.p_lit) * 2
-                            ), f"readinto failed for p_lit"
+                                engine.p_lit = _make_lit_tables(num_tables)
+                            if isinstance(engine.p_lit, list):
+                                for sub in engine.p_lit:
+                                    n = f_lit.readinto(sub)
+                                    assert n == len(sub) * 2
+                            else:
+                                n = f_lit.readinto(engine.p_lit)
+                                assert n == len(engine.p_lit) * 2
                             f_lit.close()
 
                         inbuf_name = (
@@ -2420,14 +2446,14 @@ class XZStreamDecompressor:
                         self.legacy_uncomp_size = uncomp_sz
                         self.legacy_has_eos = uncomp_sz == 0xFFFFFFFFFFFFFFFF
                         self._reinit_probs()
-                        expected_sz = 0x300 << (self.lc + self.lp)
-                        if (
-                            getattr(self, "p_lit", None) is None
-                            or len(self.p_lit) != expected_sz
+                        num_tables = 1 << (self.lc + self.lp)
+                        if getattr(self, "p_lit", None) is None or (
+                            isinstance(self.p_lit, list)
+                            and len(self.p_lit) != num_tables
                         ):
-                            self.p_lit = _make_prob_array(expected_sz)
+                            self.p_lit = _make_lit_tables(num_tables)
                         else:
-                            _reset_prob_array(self.p_lit)
+                            _reset_lit_tables(self.p_lit)
                         self.state = 0
                         self.reps = [0, 0, 0, 0]
                         if len(self.cur_block) != self.block_size:
@@ -2494,14 +2520,14 @@ class XZStreamDecompressor:
                         self.legacy_uncomp_size = uncomp_sz
                         self.legacy_has_eos = uncomp_sz == 0xFFFFFFFFFFFFFFFF
                         self._reinit_probs()
-                        expected_sz = 0x300 << (self.lc + self.lp)
-                        if (
-                            getattr(self, "p_lit", None) is None
-                            or len(self.p_lit) != expected_sz
+                        num_tables = 1 << (self.lc + self.lp)
+                        if getattr(self, "p_lit", None) is None or (
+                            isinstance(self.p_lit, list)
+                            and len(self.p_lit) != num_tables
                         ):
-                            self.p_lit = _make_prob_array(expected_sz)
+                            self.p_lit = _make_lit_tables(num_tables)
                         else:
-                            _reset_prob_array(self.p_lit)
+                            _reset_lit_tables(self.p_lit)
                         self.state = 0
                         self.reps = [0, 0, 0, 0]
                         if len(self.cur_block) != self.block_size:
@@ -2640,6 +2666,7 @@ class XZStreamDecompressor:
                                 << self.lc
                             ) + (prev_b >> (8 - self.lc))
                             lit_off = lit_st * 0x300
+                            sub = self.p_lit[lit_st]
                             symbol = 1
                             if self.state >= 7:
                                 dist = self.reps[0]
@@ -2658,16 +2685,14 @@ class XZStreamDecompressor:
                                     mbit = (mb >> 7) & 1
                                     mb = (mb << 1) & 0xFF
                                     bit = rd.decode_bit(
-                                        self.p_lit,
-                                        lit_off + ((1 + mbit) << 8) + symbol,
+                                        sub,
+                                        ((1 + mbit) << 8) + symbol,
                                     )
                                     symbol = (symbol << 1) | bit
                                     if mbit != bit:
                                         break
                             while symbol < 0x100:
-                                symbol = (symbol << 1) | rd.decode_bit(
-                                    self.p_lit, lit_off + symbol
-                                )
+                                symbol = (symbol << 1) | rd.decode_bit(sub, symbol)
                             self.cur_block[self.cur_block_pos] = symbol - 0x100
                             self.cur_block_pos += 1
                             self.state = _LIT_TRANS[self.state]
@@ -3014,14 +3039,14 @@ class XZStreamDecompressor:
                                     raise XZFormatError(
                                         f"lc + lp = {self.lc + self.lp} > 4 in LZMA2"
                                     )
-                                expected_sz = 0x300 << (self.lc + self.lp)
-                                if (
-                                    getattr(self, "p_lit", None) is None
-                                    or len(self.p_lit) != expected_sz
+                                num_tables = 1 << (self.lc + self.lp)
+                                if getattr(self, "p_lit", None) is None or (
+                                    isinstance(self.p_lit, list)
+                                    and len(self.p_lit) != num_tables
                                 ):
-                                    self.p_lit = _make_prob_array(expected_sz)
+                                    self.p_lit = _make_lit_tables(num_tables)
                                 else:
-                                    _reset_prob_array(self.p_lit)
+                                    _reset_lit_tables(self.p_lit)
                                 self.need_props = False
                             elif self.need_props:
                                 raise XZFormatError(
@@ -3048,11 +3073,14 @@ class XZStreamDecompressor:
                             self.rd_range = 0xFFFFFFFF
                             self.comp_offset = 5
                             self.chunk_comp_rem = self.chunk_comp_sz - 5
-                            if is_seekable(self.input) and hasattr(self.input, "read"):
-                                self.chunk_stream_buf = self.input.read(
+                            if (
+                                is_seekable(self.input)
+                                or _IS_DESKTOP_PY
+                                or (get_available_memory() >= 160 * 1024)
+                            ) and hasattr(self.input, "read"):
+                                self.chunk_stream_buf = self._read_exact(
                                     self.chunk_comp_rem
                                 )
-                                self.overall_input_offset += len(self.chunk_stream_buf)
                                 self.compressed_bytes_in_block += len(
                                     self.chunk_stream_buf
                                 )
@@ -3089,15 +3117,18 @@ class XZStreamDecompressor:
 
                     elif self.ctrl >= 0x80:
                         rd = self.rd
-                        if is_seekable(self.input):
+                        if (
+                            is_seekable(self.input)
+                            or _IS_DESKTOP_PY
+                            or (get_available_memory() >= 160 * 1024)
+                        ):
                             if (
                                 not self.chunk_stream_buf
                                 and getattr(self, "chunk_comp_rem", 0) > 0
                             ):
-                                self.chunk_stream_buf = self.input.read(
+                                self.chunk_stream_buf = self._read_exact(
                                     self.chunk_comp_rem
                                 )
-                                self.overall_input_offset += len(self.chunk_stream_buf)
                                 self.compressed_bytes_in_block += len(
                                     self.chunk_stream_buf
                                 )
@@ -3202,6 +3233,7 @@ class XZStreamDecompressor:
                                     << self.lc
                                 ) + (prev_b >> (8 - self.lc))
                                 lit_off = lit_st * 0x300
+                                sub = self.p_lit[lit_st]
                                 symbol = 1
                                 if self.state >= 7:
                                     dist = self.reps[0]
@@ -3222,16 +3254,14 @@ class XZStreamDecompressor:
                                         mbit = (mb >> 7) & 1
                                         mb = (mb << 1) & 0xFF
                                         bit = rd.decode_bit(
-                                            self.p_lit,
-                                            lit_off + ((1 + mbit) << 8) + symbol,
+                                            sub,
+                                            ((1 + mbit) << 8) + symbol,
                                         )
                                         symbol = (symbol << 1) | bit
                                         if mbit != bit:
                                             break
                                 while symbol < 0x100:
-                                    symbol = (symbol << 1) | rd.decode_bit(
-                                        self.p_lit, lit_off + symbol
-                                    )
+                                    symbol = (symbol << 1) | rd.decode_bit(sub, symbol)
                                 self.cur_block[self.cur_block_pos] = symbol - 0x100
                                 self.cur_block_pos += 1
                                 self.chunk_decoded += 1
@@ -4258,7 +4288,11 @@ def decompress_xz(
 
         # .plit
         f_lit = storage.open(f"{prefix}.plit", "wb")
-        f_lit.write(engine_obj.p_lit)
+        if isinstance(engine_obj.p_lit, list):
+            for sub in engine_obj.p_lit:
+                f_lit.write(sub)
+        else:
+            f_lit.write(engine_obj.p_lit)
         f_lit.flush()
         _fsync_fileobj(f_lit)
         f_lit.close()
