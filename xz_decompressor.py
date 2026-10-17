@@ -430,11 +430,17 @@ def _init_crc64():
             CRC64_TABLE.append(_c)
 
 
+_CRC64_TABLE_INITIALIZED = False
+
+
 @micropython.native
 def crc64(data, val=0):
-    if get_available_memory() >= 160 * 1024:
-        if CRC64_TABLE is None:
+    global _CRC64_TABLE_INITIALIZED
+    if not _CRC64_TABLE_INITIALIZED:
+        if get_available_memory() >= 96 * 1024:
             _init_crc64()
+        _CRC64_TABLE_INITIALIZED = True
+    if CRC64_TABLE is not None:
         c = val ^ 0xFFFFFFFFFFFFFFFF
         tab = CRC64_TABLE
         for b in data:
@@ -903,12 +909,13 @@ def select_block_size(block_size_choice="auto", available_mem=None):
     if available_mem is None:
         available_mem = get_available_memory()
 
-    # Continuous decoding budget threshold:
-    # 8192-byte blocks require ~78 KiB working set (cur_block, history cache, 12 KiB p_lit,
-    # core arrays, file I/O buffers, object overhead) plus 2x fragmentation margin -> ~160 KiB RAM.
-    if available_mem < 160 * 1024:
+    # Sizing thresholds:
+    # 512 bytes: constrained microcontrollers (< 96 KiB free RAM)
+    # 8192 bytes: intermediate microcontroller heaps (< 256 KiB free RAM)
+    # 65536 bytes: standard environments (>= 256 KiB free RAM, e.g. MicroPython default 902 KiB heap)
+    if available_mem < 96 * 1024:
         return _BS_MICRO
-    if available_mem < 1024 * 1024:
+    if available_mem < 256 * 1024:
         return _BS_MID
     return _BS_LARGE
 
@@ -1315,6 +1322,8 @@ class UnifiedHistory(HistoryBackend):
         # Tier 1: Lookback in rotating blocks in RAM
         if start_pos >= blocks_start:
             rel_offset = start_pos - blocks_start
+            if len(self.blocks) == 1:
+                return self.blocks[0][rel_offset : rel_offset + length]
             cur = 0
             for idx, blk in enumerate(self.blocks):
                 blk_sz = len(blk)
@@ -3161,6 +3170,7 @@ class XZStreamDecompressor:
                                     << self.lc
                                 ) + (prev_b >> (8 - self.lc))
                                 lit_off = lit_st * 0x300
+                                symbol = 1
                                 if self.state >= 7:
                                     dist = self.reps[0]
                                     if dist < self.cur_block_pos:
@@ -3176,10 +3186,21 @@ class XZStreamDecompressor:
                                             mb = ms[0] if ms else 0
                                         else:
                                             mb = 0
-                                    symbol = rd.decode_literal(self.p_lit, lit_off, mb)
-                                else:
-                                    symbol = rd.decode_literal(self.p_lit, lit_off, -1)
-                                self.cur_block[self.cur_block_pos] = symbol
+                                    while symbol < 0x100:
+                                        mbit = (mb >> 7) & 1
+                                        mb = (mb << 1) & 0xFF
+                                        bit = rd.decode_bit(
+                                            self.p_lit,
+                                            lit_off + ((1 + mbit) << 8) + symbol,
+                                        )
+                                        symbol = (symbol << 1) | bit
+                                        if mbit != bit:
+                                            break
+                                while symbol < 0x100:
+                                    symbol = (symbol << 1) | rd.decode_bit(
+                                        self.p_lit, lit_off + symbol
+                                    )
+                                self.cur_block[self.cur_block_pos] = symbol - 0x100
                                 self.cur_block_pos += 1
                                 self.chunk_decoded += 1
                                 self.state = _LIT_TRANS[self.state]
@@ -5623,10 +5644,10 @@ class TestXZDecompressor(_TestCaseBase):
         self.assertIsNone(parse_duration(None))
 
     def test_storage_auto_block_size_threshold(self):
-        # Continuous decoding threshold: 512 bytes (< 160 KiB RAM), 8192 bytes (< 1 MiB RAM), 65536 bytes otherwise
-        micro_mem = 96 * 1024  # 96KB (< 160KB)
-        mid_mem = 256 * 1024  # 256KB (< 1 MiB)
-        norm_mem = 10 * 1024 * 1024  # 10MB (>= 1 MiB)
+        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 256 KiB RAM), 65536 bytes otherwise
+        micro_mem = 64 * 1024  # 64KB (< 96KB)
+        mid_mem = 128 * 1024  # 128KB (< 256KB)
+        norm_mem = 10 * 1024 * 1024  # 10MB (>= 256KB)
 
         self.assertEqual(select_block_size("auto", available_mem=micro_mem), 512)
         self.assertEqual(select_block_size("auto", available_mem=mid_mem), 8192)
@@ -6228,13 +6249,13 @@ class TestXZDecompressor(_TestCaseBase):
         self.assertEqual(bytes(out), raw)
 
     def test_allowed_block_size_enforcement(self):
-        # Continuous decoding threshold: 512 bytes (< 160 KiB RAM), 8192 bytes (< 1 MiB RAM), 65536 bytes otherwise
+        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 256 KiB RAM), 65536 bytes otherwise
         self.assertEqual(select_block_size("auto", available_mem=32 * 1024), 512)
-        self.assertEqual(select_block_size("auto", available_mem=96 * 1024), 512)
-        self.assertEqual(select_block_size("auto", available_mem=159 * 1024), 512)
-        self.assertEqual(select_block_size("auto", available_mem=160 * 1024), 8192)
-        self.assertEqual(select_block_size("auto", available_mem=512 * 1024), 8192)
-        self.assertEqual(select_block_size("auto", available_mem=1024 * 1024), 65536)
+        self.assertEqual(select_block_size("auto", available_mem=64 * 1024), 512)
+        self.assertEqual(select_block_size("auto", available_mem=95 * 1024), 512)
+        self.assertEqual(select_block_size("auto", available_mem=96 * 1024), 8192)
+        self.assertEqual(select_block_size("auto", available_mem=255 * 1024), 8192)
+        self.assertEqual(select_block_size("auto", available_mem=256 * 1024), 65536)
         self.assertEqual(
             select_block_size("auto", available_mem=16 * 1024 * 1024), 65536
         )
