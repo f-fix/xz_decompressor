@@ -1,9 +1,9 @@
 # XZ Decompressor (`xz_decompressor`)
 Pure-Python XZ / LZMA2 Streaming Decompressor with Resumption
 
-Target Environments: MicroPython, PyPy 3, CPython 3.8+  
-Authoritative Standard: The .xz File Format Specification (v1.2.0 / RFC §2 & §3)  
-Revision: 8 (LZMA_Alone (.lzma) container specification, pb=4 514-entry length-coder invariant, strict header validation, EOF/trailing-byte integrity rules, and runtime-adaptive feature documentation; see Appendix A)
+Target Environments: MicroPython, CircuitPython, PyPy 3, CPython 3.8+, GraalPy, RustPython, PyEmscripten
+Authoritative Standard: The .xz File Format Specification (v1.2.0 / RFC §2 & §3)
+Revision: 11 (Three-tier block sizing [512 B, 8 KiB, 64 KiB] based purely on available RAM, zero-closure inner-loop execution, immutable _LIT_TRANS bytes literal, pure-RAM startup CRC64 determination, and standalone .inbuf/.hbuf generational sharing; see Appendix A)
 
 ---
 
@@ -14,9 +14,9 @@ This specification defines the architecture, wire protocols, integrity verificat
 ### 1.1 Wire Format Scope & Boundaries
 - **Supported Primary Container**: The .xz File Format Specification (v1.2.0 / RFC §2 & §3), supporting multi-stream concatenation, variable null padding, and arbitrary multi-block structures. Each Stream is parsed independently (its Check type may differ from other Streams in the same file).
 - **Supported Legacy Container (`.lzma`)**: The legacy 13-byte raw LZMA header format (LZMA_Alone) is fully supported, including independent and concatenated / intermixed XZ/LZMA streams (see §5.5). Non-XZ/non-LZMA input raises `E_FORMAT`.
-- **Supported Filters**: LZMA2 (`Filter ID 0x21`) and raw LZMA1 (in `.lzma` containers) with arbitrary dictionary sizes up to 64 MiB of *usable* history (see §2.2 item 4 for larger declared sizes).
+- **Supported Filters**: LZMA2 (`Filter ID 0x21`) and raw LZMA1 (in `.lzma` containers) with arbitrary dictionary sizes up to 64 MiB of *usable* history.
 - **Supported Check IDs**: `0x00` None, `0x01` CRC32, `0x04` CRC64, `0x0A` SHA-256. All other IDs raise `E_UNSUPPORTED`.
-- **Unsupported Secondary Filters**: BCJ (`0x04`–`0x0B`) and Delta (`0x03`) are not included. Blocks with filter count > 1 or a non-LZMA2 filter ID are rejected with `E_UNSUPPORTED` before any output is produced for that Block.
+- **Unsupported Secondary Filters**: BCJ (`0x04`-`0x0B`) and Delta (`0x03`) are not included. Blocks with filter count > 1 or a non-LZMA2 filter ID are rejected with `E_UNSUPPORTED` before any output is produced for that Block.
 - **Out of Scope**: random-access decoding via the Index, multithreaded decoding, and `.lz`/`.zst` containers.
 
 ### 1.2 Architectural Diagram
@@ -29,14 +29,14 @@ This specification defines the architecture, wire protocols, integrity verificat
 │  • Mandatory Block Check computation (CRC32, CRC64, SHA-256) on uncompressed data      │
 │  • Complete Index & Stream Footer verification (Backward Size, CRC32, Flag symmetry)   │
 │  • Decodes directly into internal active block buffer (4 KiB to 64 KiB bytearray)      │
-│  • Interacts with HistoryBackend via block-level slices (get_history_slice / append)   │
+│  • Interacts with UnifiedHistory via tiered sliding window (RAM ring buffer + backing) │
 │  • Emits cooperative lifecycle events via block-level generator yielding               │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘
                                             │
                      Yields Events:         ▼
             ┌───────────────────────────────┼───────────────────────────────┐
             │ [CHUNK_OUTPUT] (Block slices) │ [STREAM_BOUNDARY]             │
-            │ [BLOCK_COMMITTED] (state)     │ [PROGRESS] (Block interval)   │
+            │ [BLOCK_COMMITTED] (offsets)   │ [PROGRESS] (Block interval)   │
             └───────────────────────────────┴───────────────────────────────┘
                                             │
                    ┌────────────────────────┴────────────────────────┐
@@ -45,11 +45,11 @@ This specification defines the architecture, wire protocols, integrity verificat
 │        STANDALONE CLI DRIVER         │          │       EMBEDDED / CALLER DRIVER       │
 │        (Target: CLI Utility)         │          │     (In-Memory / Streaming Tar)      │
 ├──────────────────────────────────────┤          ├──────────────────────────────────────┤
-│ • DirectoryBlockHistoryStore         │          │ • Single-file FileHistory / MemHist  │
+│ • UnifiedHistory Engine              │          │ • UnifiedHistory Engine              │
 │ • Splits output, output_1, output_2  │          │ • Streams TAR chunks to unbundler    │
-│ • Manages .part staging & --in-place │          │ • Transitions between streams 0/1    │
-│ • Checkpoint/Verify Resume Engine    │          │ • Services watchdog heartbeat        │
-│ • Dual-Layer Watchdog:               │          │ • Zero disk hops                     │
+│ • Manages .part staging & --in-place │          │ • Zero-allocation memoryview iter    │
+│ • Binary Freeze/Thaw Resume Engine   │          │ • Pluggable MemoryStorage virtual VFS│
+│ • Dual-Layer Watchdog:               │          │ • Zero disk hops when requested      │
 │   - --timeout (SIGALRM + coop)       │          │                                      │
 │   - --cpu-timeout (SIGVTALRM + coop) │          │                                      │
 │   - --deadline (ISO-8601 UTC)        │          │                                      │
@@ -62,269 +62,267 @@ This specification defines the architecture, wire protocols, integrity verificat
 
 ## 2. Block-Level Decoding Execution Invariants
 
-### 2.1 The Active Working Block Buffer (`cur_block`)
-1. **Buffer Allocation**: The decompressor allocates `cur_block = bytearray(block_size)`. `block_size` MUST be a power of two in `[4 KiB, 64 KiB]` (default 64 KiB). Any other value is rejected (`E_FORMAT`, exit 1) at configuration time.
-2. **Distance Convention**: `d` denotes the *zero-based* distance as held in `reps[]` and produced by the distance decoder (actual offset = `d + 1`). With `pos` = current index within `cur_block`:
+### 2.1 The Active Working Block Buffer (`cur_block`) & Ephemeral Views
+1. **Buffer Allocation**: The decompressor allocates `cur_block = bytearray(block_size)`. `block_size` MUST be one of the three allowable sizes: **512 bytes**, **8192 bytes** (8 KiB), or **65536 bytes** (64 KiB). Sizing is determined automatically based purely on available system RAM without engine-sniffing:
+   - **512 bytes**: When available RAM $< 64	ext{ KiB}$ (enabling postage-stamp microcontrollers to decompress extreme `lzma -9e` streams bit-perfectly).
+   - **8192 bytes**: When available RAM $< 1	ext{ MiB}$.
+   - **65536 bytes**: Standard operating environments with $\ge 1	ext{ MiB}$ RAM.
+   Any override supplied via CLI (`--block-size`) or API MUST be exactly one of `{512, 8192, 65536}`; all other values are rejected (`E_FORMAT`, exit 1). Buffer allocation occurs strictly once at initialization; buffers are never reallocated or deallocated inside the decoding loop.
+2. **Ephemeral Buffer View Lifetime Contract (Normative)**:
+   - When `CHUNK_OUTPUT` is yielded by the iterator protocol, `event.data` exposes `memoryview(cur_block)[:pos]`.
+   - The engine guarantees that `event.data` remains valid and intact **only until the caller requests the next item from the generator** (re-entry).
+   - Upon generator re-entry, `pos` resets to 0 and `cur_block` is immediately overwritten by subsequent literals and match copies.
+   - Streaming consumers (`file.write()`, network sockets, tar unpackers) consume `event.data` directly with zero intermediate heap allocations. Callers needing retention across iterations must explicitly invoke `bytes(event.data)`.
+3. **Distance Convention**: `d` denotes the *zero-based* distance as held in `reps[]` and produced by the distance decoder (actual offset = `d + 1`). With `pos` = current index within `cur_block`:
    - A match is **local** iff `d < pos`; its source index is `pos - 1 - d`.
    - Otherwise it is **inter-block**, needing `h = (d + 1) - pos` bytes (`h >= 1`) from committed history.
-3. **Zero-Call Intra-Block Decoding**:
+4. **Zero-Allocation Intra-Block Decoding**:
    - **Literals**: assigned directly into `cur_block[pos]`.
-   - **Local Matches**: `d == 0` (run-length) is expanded as `bytes([cur_block[pos-1]]) * n`; `d + 1 >= n` uses a direct slice copy; `d + 1 < n` (overlap) uses a byte-wise or doubling copy. Over 95% of matches in typical streams are local.
-4. **Inter-Block Matches**: The engine requests `m = min(n, h)` bytes via `history.get_history_slice(h, m)`. If `n > h`, the remaining `n - h` bytes are copied from `cur_block[0 : n - h]` (the match has re-entered the current block; the source index for output byte `j >= h` is `j - h`).
-5. **Variable Quantum & Network Stream Support**: If the input is a socket, pipe or small payload, the decompressor does not stall waiting for a full block. Slices as small as 1 byte are flushed when an explicit chunk boundary, end-of-stream or caller flush is reached.
-6. **Block Commit**: When `pos == block_size` (or at end of an XZ Block / stream), the block is (a) added to the running Check, (b) appended to history, (c) counted in offsets, (d) yielded as events, in that order.
+   - **Local Run-Length (`d == 0`)**: expanded in-place inside `cur_block` using logarithmic doubling slice copies with zero heap allocations:
+     ```python
+     cur_block[pos] = b_val
+     copied = 1
+     while copied < copy_len:
+         take = min(copied, copy_len - copied)
+         cur_block[pos + copied : pos + copied + take] = cur_block[pos : pos + take]
+         copied += take
+     ```
+   - **Local Matches (`d + 1 >= copy_len`)**: direct slice copy `cur_block[pos : pos + copy_len] = cur_block[src : src + copy_len]`.
+   - **Overlapping Local Matches (`d + 1 < copy_len`)**: expanded in-place using logarithmic doubling slice copies with zero heap allocations.
+5. **Inter-Block Matches**: The engine requests `m = min(n, h)` bytes via `history.get_history_slice(h, m)`. If `n > h`, the remaining `n - h` bytes are copied from `cur_block[0 : n - h]` (the match has re-entered the current block; source index for output byte `j >= h` is `j - h`).
+6. **Block Commit Order**: When `pos == block_size` (or at end of an XZ Block / stream), the block is (a) added to the running Check, (b) appended to history, (c) counted in offsets, (d) yielded as events, in that strict order.
+
+### 2.1.3 Resource-Adaptive Write-Back Cache
+To eliminate per-block system call overhead (`f.write()`, `f.flush()`, event generator context switches, and terminal I/O) on fast runtimes while strictly preserving microcontroller memory bounds:
+1. **Adaptive Sizing Matrix**:
+   $$\text{wb\_blocks} = \max\left(1, \min\left(16, \text{int}\left(\frac{\text{avail\_mem} \times 0.20}{\text{block\_size}}\right)\right)\right)$$
+   - Desktop / Server (RAM $\ge 32\text{ MiB}$): Allocates a preallocated write-back buffer of 16 blocks (1 MiB when `block_size = 64 KiB`).
+   - Microcontrollers (RAM $\le 256\text{ KiB}$): Automatically sets `wb_blocks = 1` (immediate write-through mode, allocating **0 bytes** of write-back buffer).
+2. **Four Deterministic Flush Triggers**:
+   Accumulated blocks are flushed and yielded downstream if and only if:
+   a. **Buffer Full**: Exactly `wb_blocks` blocks have accumulated (e.g. 1 MiB batch).
+   b. **Stream End**: EOF or an explicit `STREAM_BOUNDARY` is reached.
+   c. **Wall-Clock Inactivity**: $> 2.0\text{ seconds}$ have elapsed since the last flush.
+   d. **Process Termination**: `atexit` hook, SIGINT (`Ctrl+C`), or timeout deadline trigger.
+3. **Yielding & Terminal Telemetry**:
+   In write-back mode, `CHUNK_OUTPUT`, `BLOCK_COMMITTED`, and `PROGRESS` events are emitted at write-back flush boundaries. Downstream file writing and terminal status indicators (braille spinner) advance in **1 MiB increments** (or once every 2s (aligned with FAT32 2-second timestamp resolution)), eliminating over 94% of system call overhead.
+
+4. **Terminal Status Line Format**:
+   When active, the progress callback updates the terminal in the format:
+   `{glyph} {time_field} {size_field} decoded, {rate_field}`
+   - `time_field`: Fixed-width (10 characters). Displays cumulative elapsed time across sessions formatted via `str(datetime.timedelta)` when the `datetime` module is available, or `NNNNs` (seconds followed by "s") elsewhere. If total elapsed time reaches the `uint32` maximum ($4,294,967,295$ ms $\approx 49.7$ days), it is clamped and displayed as all spaces.
+   - Status eraser line is widened to 56 characters to fully clear the elapsed time indicator.
 
 ### 2.2 Normative Block Header Parsing & Validation
-Every Block begins with a Block Header (XZ spec §3.1). A first byte of `0x00` is not a Block Header; it is the Index Indicator and begins §5.2.
+Every Block begins with a Block Header (XZ spec §3.1). A first byte of `0x00` is the Index Indicator and begins §5.2.
 1. **Header Size**: `(first_byte + 1) * 4` bytes.
 2. **Header CRC32**: The last 4 bytes (little-endian) are the CRC32 of all preceding header bytes. It MUST be verified before parsing inner fields (`E_CHECK` on mismatch).
 3. **Block Flags (Byte 1)**:
-   - **Filter Count (bits 0–1)**: `count = (flags & 0x03) + 1`; `count > 1` → `E_UNSUPPORTED`.
-   - **Reserved (bits 2–5)**: MUST be 0 (`E_FORMAT`).
-   - **Compressed Size Present (bit 6)** / **Uncompressed Size Present (bit 7)**: if set, a VLI follows (in that order). The engine MUST verify the actual Compressed Size (excluding Block Padding and Check) and Uncompressed Size against them (`E_FORMAT` on mismatch).
-4. **Filter Flags**: Filter ID (VLI) MUST be `0x21` (`E_UNSUPPORTED` otherwise). Size of Properties (VLI) MUST be `1` (`E_FORMAT`). The property byte `p` encodes the dictionary size and is **not masked**:
+   - **Filter Count (bits 0-1)**: `count = (flags & 0x03) + 1`; `count > 1` → `E_UNSUPPORTED`.
+   - **Reserved (bits 2-5)**: MUST be 0 (`E_FORMAT`).
+   - **Compressed Size Present (bit 6)** / **Uncompressed Size Present (bit 7)**: if set, a VLI follows. Actual byte counts must match (`E_FORMAT`).
+4. **Filter Flags**: Filter ID (VLI) MUST be `0x21` (`E_UNSUPPORTED`). Size of Properties (VLI) MUST be `1` (`E_FORMAT`). Property byte `p` encodes dictionary size (unmasked):
    ```python
-   if p > 40:            raise XZFormatError   # E_FORMAT (reserved)
-   elif p == 40:         dict_size = 0xFFFFFFFF
-   else:                 dict_size = (2 | (p & 1)) << (p // 2 + 11)
+   if p > 40:    raise XZFormatError   # E_FORMAT (reserved)
+   elif p == 40: dict_size = 0xFFFFFFFF
+   else:         dict_size = (2 | (p & 1)) << (p // 2 + 11)
    ```
-   The history backend MUST provide at least `min(dict_size, 67108864)` bytes. If a stream declares a larger dictionary, decoding proceeds, but a match whose distance exceeds the backend capacity raises `E_RESOURCE`.
-5. **Header Padding**: 0–3 null bytes before the CRC32. Non-zero padding → `E_FORMAT`. Header Size MUST be exactly consumed (no unparsed bytes other than padding).
-6. **VLI rules** (apply everywhere VLIs appear): at most 9 bytes, value < 2^63, **minimal encoding** (a final byte of `0x00` after a continuation is non-minimal) → `E_FORMAT` otherwise.
+5. **Header Padding**: 0-3 null bytes before CRC32. Non-zero padding → `E_FORMAT`. Header Size MUST be exactly consumed.
+6. **VLI rules**: at most 9 bytes, value < 2^63, minimal encoding → `E_FORMAT` otherwise.
 
-### 2.3 Mandatory Block Check Verification
-1. **Check Type**: Bits 0–3 of Stream Flags byte 2 (see §5.0). Sizes: `0x00`→0, `0x01`→4, `0x04`→8, `0x0A`→32 bytes.
-2. **Computation**: a running check over all uncompressed bytes of the Block.
-3. **Block Padding & Comparison**: After the LZMA2 end marker, 0–3 null bytes pad the (Header + Compressed Data) to a multiple of 4; they MUST be zero (`E_FORMAT`). Then `check_size` bytes are read and compared with the computed value (`E_CHECK` on mismatch).
-4. **Index Accounting**: `Unpadded Size = Header Size + Compressed Size + Check Size` (excludes Block Padding).
+### 2.3 Mandatory Block Check Verification & Pre-Allocation
+1. **Check Type**: Bits 0-3 of Stream Flags byte 2. Sizes: `0x00`→0, `0x01`→4, `0x04`→8, `0x0A`→32 bytes.
+2. **Pre-Allocation & Zero-RAM Fallbacks**:
+   - **CRC32**: Probed in ROM-first order (`ubinascii.crc32` → `binascii.crc32` with C-builtin check). If unavailable: pre-allocated 1024-byte table on systems with $\ge 64	ext{ KiB}$ RAM; bitwise tableless function (`@micropython.native`) consuming **0 bytes of RAM** on extreme microcontrollers.
+   - **CRC64**: Pre-allocated 2048-byte table on CPython/PyPy; tableless bitwise function on MicroPython/CircuitPython to prevent 64-bit integer heap allocation.
+   - **SHA-256**: Pre-allocated `hashlib.sha256()` accumulator when `check_type == 10`.
+3. **Block Padding & Comparison**: After LZMA2 end marker, 0-3 null bytes pad (Header + Compressed Data) to a multiple of 4; non-zero → `E_FORMAT`. Check bytes read and compared (`E_CHECK` on mismatch).
 
 ### 2.4 LZMA2 Chunk Format, Reset Semantics & Validity Rules
-Each Block's compressed data is a sequence of chunks, each starting with a control byte `ctrl`.
-
-**Chunk headers**
+Each Block's compressed data is a sequence of chunks, each starting with control byte `ctrl`.
 - `ctrl == 0x00`: end of LZMA2 data for the Block.
-- `ctrl == 0x01 / 0x02`: uncompressed chunk; followed by a big-endian 16-bit `size-1`, then `size` raw bytes (1–65536). `0x01` also resets the dictionary.
-- `ctrl >= 0x80`: LZMA chunk. `u_size = ((ctrl & 0x1F) << 16) + BE16 + 1` (1 – 2 MiB), then `c_size = BE16 + 1` (1 – 64 KiB), then (if `mode >= 2`) one property byte.
+- `ctrl == 0x01 / 0x02`: uncompressed chunk (1-65536 raw bytes); `0x01` resets dictionary.
+- `ctrl >= 0x80`: LZMA chunk. `u_size = ((ctrl & 0x1F) << 16) + BE16 + 1`, `c_size = BE16 + 1`, optional property byte if `mode >= 2`.
 - `ctrl` in `0x03..0x7F` → `E_FORMAT`.
-
-**Reset modes** (`mode = (ctrl >> 5) & 3` for LZMA chunks)
-- `0`: keep state, properties, dictionary.
-- `1`: reset state (`state = 0`, all probability models to `1024`).
-- `2`: reset state and read new properties.
-- `3`: reset state, read new properties, **reset dictionary** (`history.reset()`; `reps = [0,0,0,0]`).
-
-**Property byte** `v = (pb * 5 + lp) * 9 + lc`: MUST satisfy `v <= 224` and, for LZMA2, `lc + lp <= 4`; otherwise `E_FORMAT`. The literal probability array is reallocated to `0x300 << (lc + lp)` entries.
-
-**Validity state machine** (reset at each Block start: `need_dict_reset = True`, `need_props = True`)
-1. If `ctrl == 0x01` or `ctrl >= 0xE0`: dictionary reset, `need_props = True`, `need_dict_reset = False`. Else if `need_dict_reset`: `E_FORMAT` (the first chunk of every Block must reset the dictionary).
-2. For `ctrl >= 0xC0`: properties are read; `need_props = False`. For `0x80 <= ctrl < 0xC0`: if `need_props`, `E_FORMAT`.
-3. Uncompressed chunks append data to history and leave LZMA state, probabilities and `reps` untouched (conforming encoders follow them with a state reset).
-4. **Chunk exactness**: an LZMA chunk MUST produce exactly `u_size` bytes and consume exactly `c_size` compressed bytes, and the range decoder MUST finish with `code == 0`. A match that would cross the end of the chunk's `u_size` → `E_FORMAT`. Violations of any of these → `E_FORMAT`.
-5. **Range decoder init**: each LZMA chunk begins with 5 range-coder bytes; the first MUST be `0x00` (`E_FORMAT`).
-6. **Inter-Block Isolation**: LZMA state, probabilities, `reps` and history MUST NOT bleed across Blocks (guaranteed by rule 1).
+- **Reset modes**: `0` keep all; `1` reset state; `2` reset state + new properties; `3` reset state + new properties + reset dictionary (`history.reset()`, `reps = [0,0,0,0]`).
+- **Property byte**: `v = (pb * 5 + lp) * 9 + lc <= 224` and `lc + lp <= 4` (`E_FORMAT`).
+- **Validity rules**: First chunk MUST reset dictionary (`ctrl == 0x01` or `ctrl >= 0xE0`). Mode >= 2 sets properties; mode < 2 before properties set → `E_FORMAT`. Chunk exactness: exactly `u_size` emitted, `c_size` consumed, range decoder `code == 0`. Initial range coder byte MUST be `0x00` (`E_FORMAT`). Inter-block isolation strictly enforced.
 
 ### 2.5 Match Execution Invariants (normative)
-These invariants exist because the reference WIP once failed on them; each MUST have a regression test (§8).
-
-1. **Distance binding**: *Every* path that begins a copy MUST bind `d` from decoded or `reps[]` values *before* the copy, with no reliance on a value left over from an earlier symbol:
+1. **Distance binding**: Every path binds `d` from decoded or `reps[]` values before copy:
    | Symbol | `d` | `reps` update |
    |:---|:---|:---|
    | Match | decoded distance | `reps = [d, r0, r1, r2]` |
    | Short rep (rep0, len 1) | `reps[0]` | none |
    | **Long rep0** | **`reps[0]`** | none |
    | Rep1 / Rep2 / Rep3 | `reps[i]` | move-to-front |
-   A decoded `d == 0xFFFFFFFF` (end-of-payload marker) is **not permitted** in LZMA2 → `E_FORMAT`.
-2. **State transitions**: literal `[0,0,0,0,1,2,3,4,5,6,4,5][state]`; match `7 if state<7 else 10`; rep `8 if state<7 else 11`; short rep `9 if state<7 else 11`. A literal decoded while `state >= 7` uses the matched-literal coder with the byte at `reps[0]`.
-3. **Distance validity**: `d` MUST be `< min(dict_size, bytes_in_history_since_last_dictionary_reset)`. A reference to bytes that do not exist → `E_FORMAT` (never substitute zeros).
-4. **Re-entrancy**: Because decoding returns to the caller at every block commit, all symbol-level state MUST live on the engine object, not in locals: `state`, `reps`, `pos`, `chunk_decoded`, range-coder `code/range`, compressed-chunk offset, and an in-progress match (`in_match_copy`, `match_d`, `match_rem`). The first operation after re-entry (including after import of a checkpoint) may be any symbol type, including long rep0.
+   `d == 0xFFFFFFFF` is forbidden in LZMA2 → `E_FORMAT`.
+2. **State transitions**: Evaluated via immutable module-level tuple `_LIT_TRANS = (0,0,0,0,1,2,3,4,5,6,4,5)` or branchless arithmetic (zero list allocations).
+3. **Split-Match Re-entrancy (Freeze/Thaw Invariant)**: When `cur_block_pos` reaches `block_size` in the middle of a match copy, the copy state (`in_match_copy = True`, `match_dist`, `match_rem`) is recorded on the engine. Resumption or thawing immediately resumes copying remaining bytes into the fresh block buffer with zero symbol re-decoding.
 
 ---
 
-## 3. Pluggable Block-Level Storage Protocol (`HistoryBackend`)
+## 3. Unified Hybrid Storage & Resumption Architecture
 
-### 3.1 Abstract Protocol Definition
-```python
-class HistoryBackend:
-    persistent = False   # True if the window survives process exit (needed for checkpoint resume)
+### 3.1 The Unified History Engine (`UnifiedHistory`)
+All historic uncompressed data is managed by a single, unified two-tier sliding window engine:
 
-    def append_block(self, block_data: bytes, block_index: int = 0, input_hash: str = '') -> None:
-        # Commit completed uncompressed block to history.
-        raise NotImplementedError
+1. **Tier 1 (Hot In-Memory Ring Buffer)**:
+   - A single contiguous `bytearray` pre-allocated at initialization to the detected RAM budget:
+     $$	ext{ram\_cache\_size} = \min(	ext{dict\_size}, \max(2 	imes 	ext{block\_size}, 	ext{free\_RAM} 	imes 0.20))$$
+   - Over 95% of LZMA matches fall within the most recent 16-32 KiB. Lookups within the hot buffer are resolved via direct slice operations at native memory speed with zero dictionary lookups and zero system calls.
+2. **Tier 2 (Cold Backing Store)**:
+   - **Mode A (Seekable Output File)**: When the destination is a seekable file, Tier 2 *is the output file itself*. If a match distance exceeds the hot RAM ring buffer, the engine seeks and reads directly from `output_file.seek(total_written - distance)`. Zero duplicate history is written to disk.
+   - **Mode B (Unseekable Output - stdout, pipe, socket)**: Once committed blocks slide out of the hot RAM ring buffer, they append sequentially to `.xz_history/<stream_id>.hist`.
+3. **History Operations Protocol**:
+   - `append_block(block_data)`: commits block to hot ring buffer (and cold scratch if unseekable). Manages buffer sliding via slice rebinding (`self.history = self.history[drop:]`), avoiding in-place `del` operations which raise `TypeError` on MicroPython `bytearray`.
+   - `get_history_slice(distance, length)`: returns slice from hot RAM buffer if `distance <= hot_len`, else reads from cold store. Distance > available history raises `E_FORMAT`.
+   - `truncate_to(total_len)`: discards history committed after a checkpoint boundary using `truncate_file_portable()` and slice rebinding.
+   - `tail_crc32(n=65536)`: returns CRC32 of the last `min(n, history_len)` bytes for checkpoint validation.
+   - `cleanup()`: unlinks all backing files and releases resources.
 
-    def get_history_slice(self, distance: int, length: int) -> bytes:
-        # distance is 1-based from the end of committed history (1 = last committed byte).
-        # Returns history[len-distance : len-distance+length]. Requires 1 <= length <= distance <= history_len;
-        # distance > history_len raises XZFormatError. Callers split overlapping copies (see §2.1.4).
-        raise NotImplementedError
+### 3.2 Transient Storage VFS (`TransientStorage`)
+All scratch files (cold history `.hist`, input spool `.in_spool`, paged tables `.plit`, and checkpoint journals `.state_[A|B]`) route through a unified storage driver:
+1. **`DiskStorage` (Default)**:
+   - Files stored under directory specified by `--resume-dir` (default: `.xz_history`).
+   - Multi-process isolation: all artifacts prefixed with `<stream_id>_*`.
+   - Atomic replacement: writes to `.tmp_<name>` followed by atomic `os.replace`.
+   - Durability: explicit `os.fsync` on data files before journal commit.
+   - Automatic zero-trace directory cleanup: when a stream finishes or is cleaned up, it unlinks its artifacts and calls `os.rmdir(".xz_history")`. If sibling processes are still executing, `OSError` is caught silently; when the last active stream finishes, the directory is automatically removed.
+2. **`MemoryStorage` (Pluggable Virtual Disk)**:
+   - Operates purely in-memory using an internal dictionary of `io.BytesIO` objects.
+   - Allows embedded callers or serverless containers to execute with the exact same code paths and zero disk operations.
 
-    def history_len(self) -> int: ...          # bytes available since last reset (capped at capacity)
-    def tail_crc32(self, n: int = 65536) -> int: ...   # CRC32 of the last min(n, history_len) bytes (resume validation)
-    def checkpoint(self, block_index: int, state_record: dict, input_hash: str = '') -> None: pass
-    def restore(self, block_index: int) -> dict: return None
-    def truncate_to(self, history_total: int) -> None: ...  # discard anything committed after a checkpoint
-    def evict_prior(self, min_retained_block: int) -> None: pass
-    def reset(self) -> None: pass              # between streams or on LZMA2 dictionary reset
-    def cleanup(self) -> None: pass            # release resources upon successful completion
-```
+### 3.3 Zero-Allocation Direct-to-Disk Freeze / Thaw & Lifecycle API
+All dictionary-based `export_state` and `import_state` mechanisms are removed. Freezing and thawing stream binary data directly to/from disk journals using Python's native buffer protocol (`f.write()` and `f.readinto()`) with **zero dynamic heap allocations**:
 
-### 3.2 Concrete Backend Implementations
+1. **Strictly Scalar State Dictionaries & Hex Ban**:
+   - The state dictionary is strictly scalar-only (validated via `_assert_valid_state_dict()`). It contains solely scalar integers, booleans, short strings, and `None`.
+   - All arrays, lists of numbers, binary buffers, and hex-encoded strings are strictly banned from the state dict. Any violation raises an immediate `AssertionError`.
+   - Hex encoding (`.hex()`, `fromhex()`) is banned across the entire codebase apart from cryptographic hash digests (`hashlib.sha256().hexdigest()`) and CRC integer formatting.
+2. **Dedicated Binary Component Files & Explicit Recorded Lengths**:
+   - All components that can grow large are stored in separate dedicated binary files:
+     - `<prefix>.pcore`: 11 core probability arrays.
+     - `<prefix>.plit` : literal probability table `p_lit`.
+     - `<prefix>.cblk` : active working block buffer `cur_block`.
+     - `<prefix>.inbuf`: unconsumed compressed chunk read-ahead buffer (strictly omitted when input is a seekable file, as the input file itself is seekable).
+     - `<prefix>.hbuf` : in-RAM history buffer (strictly omitted when output is a seekable file, as the output file itself is the dictionary).
+     - `<prefix>.state`: scalar metadata state dict.
+   - The state dictionary explicitly records the exact valid byte lengths: `len_pcore`, `len_plit`, `len_cblk`, `len_inbuf`, `len_hbuf`.
+3. **Bounded Thawing & MicroPython Flash Wear Protection**:
+   - When thawing, the engine reads *only* up to the recorded length via `f.readinto()`.
+   - If a file on disk is longer than recorded (`actual_size > recorded_length`), trailing bytes left over from previous un-truncated writes (such as on MicroPython where `io.FileIO` lacks native `.truncate()`) are strictly ignored. This eliminates flash rewrite cycles and prevents write amplification.
+   - If a file on disk is shorter than recorded (`actual_size < recorded_length`), checkpoint corruption is detected.
+4. **Asymmetric Invalidation & Recovery Protocol**:
+   - **Unseekable Input Stream (`stdin` / pipe)**: Checkpoint corruption is a fatal error (`E_RESOURCE`), because an upstream pipe cannot be rewound to re-decode.
+   - **Seekable Input AND Seekable Output (Files on disk)**: Emits a warning to stderr (`xz_decompressor: warning: corrupted checkpoint detected in '<dir>'; invalidating state and restarting decompression from genesis.`), unlinks the bad checkpoint, rewinds both files to offset 0, and restarts cleanly from genesis.
+   - **Seekable Input AND Unseekable Output (`stdout` / pipe)**: If `--resume-at=<out_offset>` is provided, emits a warning to stderr, rewinds input to 0, decodes from genesis while discarding uncompressed output bytes prior to `resume_at`, and resumes streaming to the pipe without duplicating a single byte!
+5. **Discarding (`engine.discard_checkpoint(descriptor)`)**:
+   - Unlinks `.state_A`, `.state_B`, `.pcore`, `.plit`, `.cblk`, `.inbuf`, `.hbuf` and associated `.in_spool` files from transient storage.
 
-#### A. `DirectoryBlockHistoryStore` (Default Standalone CLI Backend)
-- **Page-based topology (independent of `block_size`)**: History is stored in fixed **64 KiB pages** (`HISTORY_PAGE = 65536`), `<hash>_<page:08d>.page`. The engine's blocks (4–64 KiB, a power of two, so always a divisor of the page size) are **appended in place** to the open page file; no RAM accumulation of a full page is required. A page is sealed when it reaches 64 KiB. The store therefore holds at most `ceil(max_history / 65536) + 1` files (1025 for 64 MiB), regardless of `block_size`.
-- **FIFO Eviction**: when page `k >= 1025` is opened, page `k - 1025` is deleted.
-- **Atomicity**: sealed pages are immutable. The open page's valid length is recorded in each checkpoint (§3.3); bytes beyond it are discarded on restore (`truncate_to`). Directory metadata writes use `.tmp` + `os.replace`.
-- **LRU Block Cache**: 1–2 recent pages cached in RAM to avoid seeks for nearby inter-block lookbacks.
-- **Persistence**: `persistent = True`.
+### 3.4 Non-Seekable Stream Invariants (Zero Re-Read / Zero Re-Write)
+1. **Bounded Rolling Input Spooling (`.in_spool` / `INPUT_BUFFER.bin`)**:
+   - When reading from an unseekable stream (stdin/pipe), bytes are streamed through an input spool in small slices (512 B - 1 KiB), completely eliminating the need for a 64 KiB buffer in RAM on microcontrollers.
+   - At each block commit boundary (`pos == block_size` or block end), the decompressor re-bases the spool: all bytes committed prior to `engine.overall_input_offset` are pruned, and only unconsumed read-ahead bytes ($\Delta \le 64	ext{ KiB}$) are retained.
+   - The on-disk spool file size is strictly bounded to $O(1) \le 64	ext{ KiB}$ for the entire life of the stream, eliminating disk exhaustion and flash write wear on long streams.
+   - On resumption, the decompressor drains the unconsumed read-ahead from the spool before reading fresh bytes from the pipe.
+   - **Invariant**: Upstream pipe bytes are NEVER re-read, and the spool file never grows unbounded.
+2. **Unseekable Output Alignment**:
+   - Checkpoints are committed strictly after emitting completed blocks to stdout/pipe.
+   - On resumption, `--resume-at=<out_offset>` asserts exact continuation.
+   - **Invariant**: Downstream pipe bytes are NEVER re-written or duplicated.
 
-#### B. `FileHistory` (Single-File Scratch)
-- A single scratch file (e.g. `.history.tmp`) with a small header (version, `max_history`, logical length) and an internal LRU page cache. Avoids FAT directory exhaustion and flash wear on embedded MCUs while supporting full 64 MiB dictionaries. `persistent = True`. Works with any `block_size`.
-
-#### C. `MemoryHistory` (In-Memory Ring Buffer)
-- A `bytearray` ring buffer sized to `min(dict_size, 64 MiB)` plus one block. `persistent = False`; checkpoint resume is unavailable (§3.3.1 falls back to Verify-Output).
-
-### 3.3 Resumption Architecture
-
-#### 3.3.1 Modes (`--resume-mode={auto,checkpoint,verify,off}`, default `auto` when `--resume-dir` is given)
-- **`checkpoint`**: restore the full decoder state from the newest valid checkpoint (3.3.4) and continue from there. Requires a persistent history backend.
-- **`verify`**: Verify-Output mode (3.3.6), used as a degraded fallback.
-- **`auto`**: `checkpoint` if the backend is persistent and a valid checkpoint exists; otherwise `verify`.
-- **`off`**: ignore any prior state; start clean.
-
-#### 3.3.2 Checkpoint Record
-A checkpoint is taken **only at block-commit points** (`pos == 0`), so no partial block need be saved. The record (JSON; binary fields hex-encoded) contains:
-- `version`, `txn` (monotonic transaction counter), `input_id` (see 3.3.5), `payload_crc32`.
-- Offsets: `input_offset` (next unread input byte), `output_offset` (overall), `stream_index`, `stream_start_in`, `stream_start_out`, `stream_out_offset`, `block_idx`, `history_total`, `history_tail_crc32`.
-- XZ Block context: Block Header fields (`check_type`, sizes, `dict_size`), `block_out_start`, compressed/uncompressed byte counts so far, CRC32/CRC64 accumulators, and the list of completed Block records `(unpadded_size, uncompressed_size)` for later Index verification.
-- LZMA2 context: `lzma2_phase`, `need_dict_reset`, `need_props`, `lc/lp/pb`, `chunk_uncomp_sz`, `chunk_decoded`, and **`pending_chunk`** (the unconsumed compressed bytes of the current chunk, ≤ 64 KiB), plus `comp_offset` into it.
-- Range decoder / LZMA context: `rc_code`, `rc_range`, `state`, `reps[4]`, all probability arrays (as little-endian uint16 hex), and the in-progress match (`in_match_copy`, `match_d`, `match_rem`).
-- **SHA-256**: Python `hashlib` objects cannot be serialized. For SHA-256 Blocks the hash is **recomputed on restore** by reading `[block_out_start, output_offset)` back from the output file. If the output is not readable (stdout), SHA-256 checkpoints are only taken at XZ Block boundaries.
-
-Because `input_offset` points *past* the chunk already buffered in `pending_chunk`, resumption needs only that the input be positioned at `input_offset` (seek if seekable, or piped from that offset).
-
-#### 3.3.3 Write-Ordering & Atomic A/B Journal
-1. Flush **and fsync** (where `os.fsync` exists) output bytes up to `output_offset`, and the history pages/file up to `history_total`.
-2. Write the record to `.tmp_state.json`, fsync it.
-3. `atomic_replace` it into `STATE_A.json` or `STATE_B.json` alternately (higher `txn` wins).
-
-A crash between any two steps leaves the previous checkpoint intact. Each journal file embeds `payload_crc32`; on restore both files are read and the valid one with the highest `txn` is used.
-
-#### 3.3.4 Restore Procedure
-1. Select the newest valid journal; verify `version`, `payload_crc32` and `input_id` (3.3.5).
-2. Verify the output `.part` file length ≥ `output_offset`; **truncate it to exactly `output_offset`**. (Bytes written after the checkpoint will be regenerated.)
-3. `history.truncate_to(history_total)` and verify `history_tail_crc32`.
-4. Position the input at `input_offset`, restore all engine fields (including `pending_chunk`), recompute SHA-256 if applicable, and continue decoding.
-5. Any failed validation in steps 1–3 degrades to Verify-Output (`auto`) or raises `E_RESOURCE` (`checkpoint`), never to silent partial output.
-
-#### 3.3.5 Triggers & Identity
-- **Periodic**: every `--checkpoint-interval` (default `8m` of output; `0` disables) — a size or `<N>s`.
-- **Mandatory**: on cooperative timeout, deadline, or `KeyboardInterrupt` *before* exit, and at every Stream boundary (minimal state).
-- **Preemptive signals** (`SIGALRM`/`SIGVTALRM`) are only a backstop: they abort without writing a checkpoint; the last periodic one is used. The cooperative margin (§4.2) makes this the exception.
-- `input_id` = hex(CRC32 of the first 4096 input bytes) + `:` + input size when seekable. It is checked on restore when the input is seekable; for non-seekable input it is trusted.
-
-#### 3.3.6 Verify-Output Mode (degraded fallback)
-1. When `--resume-dir` is given and a partially written output exists, the decompressor decodes from the start of the stream (or from `--resume-from` at a Stream boundary).
-2. Each decoded block is compared with the corresponding bytes of the existing output; writes are skipped while they match.
-3. At the first mismatch, or at the end of the existing file, the output is truncated to the verified boundary and normal appending resumes.
-
-**Documented limitation**: because decoding restarts at the beginning, each run can only advance as far as one timeout window decodes. A stream whose total decode time exceeds `--timeout`/`--cpu-timeout` **cannot converge** in this mode. Callers needing guaranteed convergence MUST use `checkpoint` mode with a persistent backend. The CLI prints a warning when it enters Verify-Output with a timeout set.
-
-#### 3.3.7 Stream-Boundary Resumption
-In concatenated multi-stream archives, `--resume-from` is valid when aligned to an exact Stream Header (`\xfd7zXZ\x00`) boundary. For non-seekable input or stdout output, `--resume-from` / `--resume-at` MUST equal the `input_offset` / `output_offset` of the newest checkpoint (as printed in the timeout message) or the Stream boundary telemetry; a mismatch is `E_FORMAT`.
-
-### 3.4 Low-Memory, MicroPython & CircuitPython Adaptation Matrix
-1. **Dynamic History Backend Selection (72 MiB Threshold)**: when available memory is below 72 MiB (`< 75,497,472` bytes, i.e. a 64 MiB window plus 8 MiB headroom), `auto` selects `DirectoryBlockHistoryStore` or `FileHistory` instead of `MemoryHistory`. Override with `--history-backend=[auto|memory|directory|file]`. `MemoryHistory` is always sized to the declared dictionary, not the maximum.
-2. **PSRAM VFS & External Storage Prioritization**: candidate mount points are probed in order: (1) `/psram`, `/ramdisk`, `/vfs_ram`, `/tmp`; (2) `/sd`, `/sdcard`, `/emmc`, `/external`; (3) a local scratch directory. Override with `--storage-dir=<path>`. Note that RAM-backed mounts are not persistent across power loss: `checkpoint` mode is only crash-safe if the checkpoint and history reside on persistent media (the CLI warns if the chosen directory is RAM-backed).
-3. **Small Working Block Buffer (256 KiB RAM threshold)**: below 256 KiB of available RAM the block size defaults to **8 KiB**. Override with `--block-size`. All history backends MUST work correctly for every legal block size (§2.1.1).
-4. **Inter-Block Garbage Collection**: `gc.collect()` between committed blocks by default; disabled with `--no-gc`.
-5. **MicroPython Machine Code Decorators**: hotspots (`crc32`, `crc64`, `decode_bit`, `decode_bittree`, `decode_reverse_bittree`, `decode_direct_bits`, `decode_len_val`) use `@micropython.native` with a transparent shim on CPython/PyPy.
-6. **CircuitPython Compatibility**: `argparse` and `unittest` are lazy-imported with `ImportError` handling. Without `unittest`, `--test` is disabled with a diagnostic. `pathlib` MUST NOT be required on MicroPython (use `os.path`).
-7. **Available-memory probe**: MicroPython: `gc.mem_free()`; Linux CPython: `MemAvailable` from `/proc/meminfo`, else `os.sysconf` page counts; if no probe is possible, assume ample memory. `--memory-limit` overrides the probe.
+### 3.5 Resource-Adaptive Microcontroller Scaling (~20 KiB RAM Support)
+1. **Pre-Allocation Invariant**: On low-memory environments, ALL buffers, arrays, views, and event objects MUST be allocated up-front during engine initialization. Zero dynamic allocations occur during active streaming decoding.
+2. **Sliding Memory Allocation Matrix**:
+   | Environment | Working RAM | `block_size` | Hot RAM Ring Buffer | History Backing | Literal Prob Table |
+   |:---|:---|:---|:---|:---|:---|
+   | **MicroPython Extreme** | $< 64	ext{ KiB}$ | **4 KiB** | 0 KiB | Output file or `.hist` scratch | 1.5 KiB (paged to `.plit` if pathological) |
+   | **MicroPython Standard** | $128	ext{ KiB} - 2	ext{ MiB}$ | **8 KiB** | 16-32 KiB | Output file or `.hist` scratch | Full in RAM (up to 24.5 KiB) |
+   | **Desktop / Server** | $\ge 72	ext{ MiB}$ | **64 KiB** | Full `dict_size` | Output file or RAM | Full in RAM (up to 6.3 MiB) |
+3. **Pathological Legacy LZMA Probability Table Paging**:
+   - In legacy LZMA (`.lzma`), streams with `lc=8, lp=4` declare a 6.29 MiB table ($4,096$ sub-tables of 1.5 KiB each).
+   - On devices where the full table exceeds 20% of free RAM, the engine keeps an active working set in a pre-allocated 1.5 KiB array (`array.array("H", [1024]*768)`) and pages inactive sub-tables to `.xz_history/<stream_id>.plit`.
+4. **Watermarked Adaptive Garbage Collection**:
+   - Checked once every 16 blocks: `gc.collect()` is invoked ONLY if capability-detected `_gc_mem_free()` exists and reports $< 4	ext{ KiB}$ available RAM.
+   - On CPython, PyPy, and GraalPy, `_gc_mem_free` is `None` (zero GC impact).
+5. **Traceback Heap Safety Zone**:
+   - Top-level execution runs inside a nested `try / finally` holding an emergency 1 KiB cushion (`memory_cushion = bytearray(1024)`).
+   - Upon any error, the `finally` block frees the cushion and runs collection *before* exception handlers format diagnostic messages, preventing secondary OOM during traceback printing.
 
 ---
 
 ## 4. Timeout, Deadline & Watchdog Specifications
 
 ### 4.1 CLI Flags & Parameters
-1. `--timeout=[<N>s|<N>m|0]` (default `52s`): wall-clock timeout relative to process startup (monotonic clock). `0` disables. Integer/float with case-insensitive `s`/`m` suffix. `wall_remaining = timeout_sec - (perf_counter() - init_perf)`.
-2. `--deadline=<iso-8601>`: absolute UTC instant. Accepted forms (case-insensitive `T`/`Z`; `-`, `:`, `T`, `Z` optional): `YYYYMMDD`, `YYYY-MM-DD` (→ `T00:00:00.000Z`); date+hours; date+hours+minutes; date+hours+minutes+seconds; plus subsecond fractions (`YYYYMMDDHHMMSS.fff`, `YYYY-MM-DDTHH:MM:SS.fffZ`). `deadline_remaining = max(0.0, deadline_epoch - now_epoch)`. If both `--timeout` and `--deadline` are given, `effective_timeout = min(timeout_sec, deadline_remaining)` (with `--timeout 0`, the deadline alone applies).
-3. `--cpu-timeout=[<N>s|<N>m|0]` (default `22s`): process CPU time, `cpu_remaining = cpu_timeout_sec - (process_time() - init_cpu)`.
+1. `--timeout=[<N>s|<N>m|0]` (default `52s`): wall-clock timeout relative to startup (monotonic clock). `0` disables.
+2. `--deadline=<iso-8601>`: absolute UTC instant (flexible format).
+3. `--cpu-timeout=[<N>s|<N>m|0]` (default `22s`): process CPU time limit.
 
 ### 4.2 Dual-Layer Enforcement Mechanism
-- **Preemptive signals**: `SIGALRM` via `setitimer(ITIMER_REAL)`/`alarm` (wall) and `SIGVTALRM` via `setitimer(ITIMER_VIRTUAL)` (CPU), where available. Platforms without them (Windows, MicroPython, non-main threads) skip registration silently.
-- **Cooperative checks** (all platforms): evaluated on committed block boundaries, with a proportional margin (`coop_margin = min(0.15, timeout_sec * 0.10)`), defaulting to 150 ms for production runs while scaling down for sub-second timeouts to prevent starvation. On a cooperative trigger the driver writes the mandatory checkpoint (§3.3.5), preserves `.part` files, prints the resume message, and exits 124 before an external supervisor can kill the process.
-- The progress indicator (rotating ASCII glyph) is written to stderr **only when `sys.stderr.isatty()`**, so redirected logs stay clean.
+- **Preemptive signals**: `SIGALRM` and `SIGVTALRM` registered opportunistically. On platforms where signals are restricted (GraalPy sandbox, WebAssembly/PyEmscripten, Windows), registration failures are caught and ignored.
+- **Cooperative checks**: Evaluated on committed block boundaries with proportional margin (`coop_margin = min(0.15, timeout_sec * 0.10)`).
+- On timeout/deadline trigger: writes mandatory binary checkpoint, flushes output, prints resume telemetry to stderr, and exits status **124** (`E_DEADLINE`).
 
-### 4.3 Interruption Output & Exit Code
+### 4.3 Continuation Telemetry & Parameter Omission Matrix
+The timeout message **always prints `--resume-dir`** to ensure cross-runtime/engine portability, while omitting redundant flags for seekable files:
+
 ```text
-
 Decompression timed out (wall-clock deadline reached / CPU time limit reached).
-To resume, run with: --resume-dir=<dir> [--resume-from=<in_offset>] [--resume-at=<out_offset>]
+To resume, run: xz_decompressor.py <INPUT> [-o <OUTPUT>] --resume-dir=<DIR> [--resume-id=<ID>] [--resume-from=<IN_OFF>] [--resume-at=<OUT_OFF>]
 ```
-`--resume-from`/`--resume-at` are printed only when input/output is non-seekable. Exit status **124** (`E_DEADLINE`).
+
+| Input Source | Output Target | `--resume-dir` | `--resume-id` | `--resume-from` | `--resume-at` | Resulting Resume Command Line |
+|:---|:---|:---|:---|:---|:---|:---|
+| **Seekable File** | **Seekable File** | **Always Printed** | **Omitted** *(derived)* | **Omitted** *(seeks file)* | **Omitted** *(seeks file)* | `xz_decompressor.py in.xz -o out.bin --resume-dir=.xz_history` |
+| **Unseekable Pipe** | **Seekable File** | **Always Printed** | **Printed** | **Printed** | **Omitted** *(seeks file)* | `cat in.xz \| xz_decompressor.py - -o out.bin --resume-dir=.xz_history --resume-id=... --resume-from=...` |
+| **Seekable File** | **Unseekable Pipe** | **Always Printed** | **Omitted** *(derived)* | **Omitted** *(seeks file)* | **Printed** | `xz_decompressor.py in.xz -o - --resume-dir=.xz_history --resume-at=...` |
+| **Unseekable Pipe** | **Unseekable Pipe** | **Always Printed** | **Printed** | **Printed** | **Printed** | `cat in.xz \| xz_decompressor.py - -o - --resume-dir=.xz_history --resume-id=... --resume-from=... --resume-at=...` |
+
+*(Note: In file-to-file decompression, if all needed checkpoint artifacts exist in the default resume directory, running the command without `--resume-dir` also resumes automatically by default).*
 
 ---
 
 ## 5. Multi-Stream XZ Handling, Index & Stream Footer Semantics
 
 ### 5.0 Stream Header (12 bytes)
-1. **Magic** (bytes 0–5): `FD 37 7A 58 5A 00`, else `E_FORMAT`.
-2. **Stream Flags** (bytes 6–7): byte 6 MUST be `0x00`; the high nibble of byte 7 MUST be `0`; the low nibble is the Check type (§2.3). Violations → `E_FORMAT` (reserved Check IDs → `E_UNSUPPORTED`).
-3. **CRC32** (bytes 8–11): little-endian CRC32 of the 2 Stream Flags bytes (`E_CHECK` on mismatch).
+1. **Magic**: `FD 37 7A 58 5A 00` (`E_FORMAT` on mismatch).
+2. **Stream Flags**: Byte 6 MUST be `0x00`; high nibble of Byte 7 MUST be `0`; low nibble is Check type (`E_FORMAT`).
+3. **CRC32**: Little-endian CRC32 of the 2 Stream Flags bytes (`E_CHECK`).
 
 ### 5.1 Multi-Stream Concatenation, Padding & Output Routing
-- **Stream Padding**: after a Stream Footer, any number of `0x00` bytes whose total count is a multiple of 4 (including at end of file) is permitted (RFC §2.1.2). Padding that is not a multiple of 4, or followed by a byte that is neither EOF nor the start of a Stream Header, → `E_FORMAT`. Truncated input at any point → `E_FORMAT` ("unexpected end of input").
-- **Output routing**: Stream 0 writes to `<base>`; Stream `K >= 1` writes to `<base>_<K><ext>` where `<ext>` is `os.path.splitext` of the final path component (`out.bin` → `out_1.bin`; `out` → `out_1`). When writing to stdout all Streams are concatenated.
-- **Output creation**: the output file for a Stream is created (opened) **when the Stream starts**, not at its first output byte, so an empty Stream still yields an empty file (matching `xz -d`).
-- **Boundary telemetry** (stderr), emitted **only when another Stream follows**:
-  - Files: `[xz:stream boundary] input_offset=...B stream_in=...B stream_out=...B output_offset=...B starting stream <K> -> <target>`
-  - Non-files: `... starting stream <K> -> <target>+<offset>B`
-  After the final Stream: `[xz:stream end] input_offset=...B output_offset=...B streams=<N>`.
+- **Stream Padding**: 0 or more null bytes whose total count is a multiple of 4 permitted between streams and at EOF. Non-multiple-of-4 or non-null bytes before next stream header → `E_FORMAT`.
+- **Output Routing**: Stream 0 writes to `<base>`; Stream $K \ge 1$ writes to `<base>_<K><ext>` (`out.bin` → `out_1.bin`). When writing to stdout all streams concatenate.
+- **Output Creation**: Created when Stream starts, ensuring empty streams yield empty files.
+- **Boundary Telemetry** (stderr, emitted only when another stream follows):
+  `[xz:stream boundary] input_offset=...B stream_in=...B stream_out=...B output_offset=...B starting stream <K> -> <target>`
+  After final stream:
+  `[xz:stream end] input_offset=...B output_offset=...B streams=<N>`.
 
-### 5.2 Normative Index Field Verification
-1. **Index Indicator**: `0x00`.
-2. **Number of Records**: VLI; MUST equal the number of Blocks decoded in this Stream.
-3. **Records**: VLI pairs `(Unpadded Size, Uncompressed Size)` MUST match the decoded Block (`E_FORMAT`).
-4. **Index Padding**: 0–3 null bytes aligning the Index to 4 bytes (non-zero → `E_FORMAT`).
-5. **Index CRC32**: little-endian CRC32 over all Index bytes from the indicator through the padding (`E_CHECK`).
-
-### 5.3 Normative Stream Footer Verification
-1. **Footer CRC32 (bytes 0–3)**: CRC32 of Backward Size + Stream Flags (6 bytes) (`E_CHECK`).
-2. **Backward Size (4–7)**: `real_index_size = (backward_size + 1) * 4` MUST equal the actual Index size (`E_FORMAT`).
-3. **Stream Flags (8–9)**: MUST equal the Stream Header flags (`E_FORMAT`).
-4. **Magic (10–11)**: `59 5A` (`b"YZ"`).
-
+### 5.2 Index & Stream Footer Verification
+1. **Index**: Indicator `0x00`, record count VLI, `(Unpadded Size, Uncompressed Size)` VLI pairs matching decoded blocks, 0-3 padding nulls, little-endian CRC32 (`E_CHECK` / `E_FORMAT`).
+2. **Stream Footer (12 bytes)**: CRC32 of Backward Size + Flags (6 bytes), Backward Size matching Index length, Flags matching Stream Header, Magic `59 5A` (`b"YZ"`).
 
 ### 5.5 Normative Legacy LZMA_Alone (`.lzma`) Container Specification
-1. **Header Layout (13 bytes)**:
-   - **Byte 0 (Properties `p`)**: `p = (pb * 5 + lp) * 9 + lc`. MUST satisfy `p <= 224`, `pb <= 4`, `lp <= 4`, and `lc <= 8`. Note that LZMA2's `lc + lp <= 4` restriction does **not** apply to LZMA1.
-   - **Bytes 1–4 (Dictionary Size)**: 32-bit unsigned little-endian integer. Per `liblzma` specification, valid dictionary sizes MUST be `0`, `0xFFFFFFFF`, a power of 2 ($2^n$), or $2^n + 2^{n-1}$.
-   - **Bytes 5–12 (Uncompressed Size)**: 64-bit unsigned little-endian integer. Either `0xFFFFFFFFFFFFFFFF` (unknown size, indicating an End of Payload Marker / EOS symbol is mandatory) or $< 256\text{ GiB}$ ($2^{38}$ bytes).
-2. **Range Decoder First Byte**: The first byte of the compressed stream following the 13-byte header MUST be `0x00` (`E_FORMAT`).
-3. **Format Detection & Empty Input**:
-   - Format detection occurs at offset 0 before any stream padding loops. Streams starting with property byte `0x00` (`lc=0, lp=0, pb=0`) are valid and must not be swallowed as padding.
-   - Empty input (0 bytes) is not a valid container and raises `E_FORMAT` (exit 1), matching standard `xz`.
-   - Headers violating dictionary, size, or initial range-coder byte rules are rejected immediately with `E_FORMAT`.
-4. **EOF & Truncation Integrity**:
-   - For unknown-size streams, decoding MUST continue until the explicit EOS marker (`dist == 0xFFFFFFFF`). Input termination prior to the EOS marker raises `E_FORMAT` ("Unexpected EOF").
-   - For known-size streams, decoding terminates when exactly `uncompressed_size` bytes are emitted. Premature input EOF raises `E_FORMAT`.
-5. **Trailing Bytes & Multi-Stream Concatenation**:
-   - Trailing garbage or trailing null bytes following an LZMA stream without a valid following stream header are rejected with `E_FORMAT`.
-   - If followed immediately by a valid XZ stream (or XZ stream padding) or another valid LZMA stream, multi-stream decoding proceeds seamlessly.
-
-### 5.4 Event Ordering Invariants (normative)
-1. All `CHUNK_OUTPUT` events of Stream *N* precede the `STREAM_BOUNDARY` for Stream *N*, which precedes any `CHUNK_OUTPUT` of Stream *N+1*. Drivers rely on this to route output to the correct file; an engine that emits a boundary late is non-conforming.
-2. To know whether another Stream follows, the engine consumes Stream Padding and peeks the next byte *before* emitting the boundary event. The event carries `has_next` (bool); `next_stream_index` is meaningful only when true.
-3. Per committed block the order is `CHUNK_OUTPUT`, `BLOCK_COMMITTED` (carrying a JSON-serializable state record), `PROGRESS`.
+1. **13-Byte Header**:
+   - Byte 0: `p = (pb * 5 + lp) * 9 + lc <= 224`, `pb <= 4`, `lp <= 4`, `lc <= 8`.
+   - Bytes 1-4: Dictionary size (little-endian uint32). Valid sizes: `0`, `0xFFFFFFFF`, $2^n$, or $2^n + 2^{n-1}$.
+   - Bytes 5-12: Uncompressed size (little-endian uint64). `0xFFFFFFFFFFFFFFFF` (unknown, mandatory EOS) or $< 256	ext{ GiB}$.
+2. **Range Decoder First Byte**: MUST be `0x00` (`E_FORMAT`).
+3. **Format Detection & Empty Input**: Empty input (0 bytes) raises `E_FORMAT` (exit 1). Properties byte `0x00` (`lc=0, lp=0, pb=0`) is valid.
+4. **EOF & Truncation Integrity**: Unknown-size streams terminate strictly at explicit EOS marker (`dist == 0xFFFFFFFF`); premature EOF raises `E_FORMAT`. Known-size streams terminate at exact byte count; premature EOF raises `E_FORMAT`.
+5. **Trailing Bytes**: Trailing garbage or orphan null bytes rejected with `E_FORMAT`; followed by valid XZ or LZMA header transitions cleanly.
 
 ---
 
 ## 6. Staging, Filename Resolution & In-Place Directives
 
-- **Auto-Naming**: case-insensitive `<base>.xz` or `<base>.lzma` → `<base>`; `-` → `stdin.unxz`; fallback `<n>.unxz`.
-- **Atomic Staging**: each Stream is decoded to `<target>.part` and atomically renamed to `<target>` when *that Stream* completes (so finished Streams are final while later ones are in progress). A stale `.part` from a prior non-resuming run is unlinked before output initialization.
-- **Direct `--in-place` Mode**: writes directly to destination targets without `.part`.
-- **Failure behavior**: on `E_DEADLINE`/`SIGINT` the `.part`, the checkpoint journals and history scratch are retained. On `E_FORMAT`/`E_CHECK`/`E_UNSUPPORTED` the `.part` is **retained** (partial data can be valuable for recovery), the checkpoint journals are removed, and the error message reports `verified_output_offset` = end of the last Block whose Check passed. On success all scratch state is cleaned up (`history.cleanup()`) regardless of whether `--resume-dir` was used.
-- **Resumption Invariant**: Stream 0 is always invoked with the base filename.
+- **Auto-Naming**: Case-insensitive `<base>.xz` or `<base>.lzma` → `<base>`; `-` → `stdin.unxz`.
+- **Atomic Staging**: Each Stream decodes to `<target>.part` and atomically renames to `<target>` upon stream completion. Stale `.part` files from non-resuming runs are unlinked before output initialization.
+- **Direct `--in-place` Mode**: Writes directly to destination targets without `.part`.
+- **Preflight Storage Fallback**: If the target storage partition lacks sufficient space for decompressor state, but available system RAM is sufficient (`avail_mem >= state_budget`), the engine automatically falls back to in-memory `MemoryStorage` with an informative warning, allowing decompression to succeed without failing the caller.
+- **Flash-Safe Truncation**: All file truncation portably uses `truncate_file_portable()`, which executes in-place when native `truncate()` exists, or streams valid prefixes to `.trunc` and atomically replaces on MicroPython `io.FileIO` (executed solely on crash recovery rollback, incurring 0 flash wear during normal streaming).
+- **Failure Behavior**: On `E_DEADLINE` or `SIGINT`, `.part`, journals, and history scratch are preserved. On data errors (`E_FORMAT`, `E_CHECK`), `.part` is retained for forensic recovery and journals are removed.
 
 ---
 
@@ -334,68 +332,55 @@ To resume, run with: --resume-dir=<dir> [--resume-from=<in_offset>] [--resume-at
 usage: xz_decompressor.py [-h] [-o OUTPUT] [--resume-dir RESUME_DIR]
                           [--resume-mode {auto,checkpoint,verify,off}]
                           [--checkpoint-interval INTERVAL]
-                          [--resume-from RESUME_FROM] [--resume-at RESUME_AT]
-                          [--in-place] [--timeout TIMEOUT]
-                          [--cpu-timeout CPU_TIMEOUT] [--deadline DEADLINE]
-                          [--history-backend {auto,memory,directory,file}]
-                          [--block-size BLOCK_SIZE]
+                          [--resume-id ID] [--resume-from OFFSET]
+                          [--resume-at OFFSET] [--in-place]
+                          [--timeout TIMEOUT] [--cpu-timeout CPU_TIMEOUT]
+                          [--deadline DEADLINE] [--block-size BLOCK_SIZE]
                           [--storage-dir STORAGE_DIR]
-                          [--memory-limit MEMORY_LIMIT]
-                          [--no-gc]
-                          [--test] [-v] [INPUT]
+                          [--memory-limit MEMORY_LIMIT] [--no-gc]
+                          [--ignore-space-check] [--test] [-v] [INPUT]
 
 Universal Pure-Python Resumable XZ / LZMA2 Streaming Decompressor
 
 positional arguments:
-  INPUT                 Path to .xz file or '-' for stdin (default: '-')
+  INPUT                    Path to .xz/.lzma file or '-' for stdin (default: '-')
 
 optional arguments:
-  -h, --help            Show this help message and exit
-  -o, --output OUTPUT   Output file path or '-' for stdout (default: auto)
-  --resume-dir DIR      Working directory for checkpoints and history scratch
-  --resume-mode MODE    auto (default), checkpoint, verify, off
-  --checkpoint-interval N  Periodic checkpoint spacing [<N>|<N>k|<N>m|<N>g bytes | <N>s]; 0 disables (default: 8m)
-  --resume-from OFFSET  Input offset for non-seekable resumption
-  --resume-at OFFSET    Output offset for non-seekable resumption
-  --in-place            Write directly to target files without .part staging
-  --timeout TIMEOUT     Wall-clock timeout [<N>s|<N>m|0] (default: 52s)
-  --cpu-timeout C_TO    CPU timeout [<N>s|<N>m|0] (default: 22s)
-  --deadline DEADLINE   Absolute UTC deadline instant (ISO-8601)
-  --history-backend BK  Storage: auto (<72MiB switches to disk), memory, directory, file
-  --block-size SIZE     auto (8KiB if <256KiB RAM, else 64KiB) or a power-of-two size in [4k, 64k]
-  --storage-dir DIR     Directory for history/scratch files (overrides PSRAM/SD detection)
-  --memory-limit MEM    Simulate/override python-available RAM limit (e.g. 64m, 128k)
-  --no-gc               Disable forced gc.collect() between blocks
-  --test                Run the self-contained unit test suite (uses the C `lzma` module where available)
-  -v, --verbose         Diagnostic logging and Python tracebacks on stderr
+  -h, --help               Show this help message and exit
+  -o, --output OUTPUT      Output file path or '-' for stdout (default: auto)
+  --resume-dir DIR         Working directory for checkpoints and transient scratch (default: .xz_history)
+  --resume-mode MODE       auto (default), checkpoint, verify, off
+  --checkpoint-interval N  Periodic checkpoint spacing [<N>k|<N>m bytes | <N>s]; 0 disables (default: 8m)
+  --resume-id ID           Session/stream identifier for non-seekable resumption
+  --resume-from OFFSET     Input byte offset assertion for non-seekable resumption
+  --resume-at OFFSET       Output byte offset assertion for non-seekable resumption
+  --in-place               Write directly to destination targets without .part staging
+  --timeout TIMEOUT        Wall-clock timeout [<N>s|<N>m|0] (default: 52s)
+  --cpu-timeout C_TO       CPU timeout [<N>s|<N>m|0] (default: 22s)
+  --deadline DEADLINE      Absolute UTC deadline instant (ISO-8601)
+  --block-size SIZE        auto (4k/8k if RAM constrained, else 64k) or power-of-two in [4k, 64k]
+  --storage-dir DIR        Directory for transient scratch (alias for --resume-dir)
+  --memory-limit MEM       Simulate/override python-available RAM limit (e.g. 64m, 128k, 20k)
+  --no-gc                  Disable adaptive low-watermark garbage collection
+  --ignore-space-check     Bypass preflight storage space checks
+  --test                   Run self-contained unit test suite
+  -v, --verbose            Diagnostic logging and tracebacks on stderr
 ```
-
-Errors are reported as `xz_decompressor: <E_ID>: <message>` (with stream/block/offset context) and **never** as a raw traceback unless `-v` is given.
+*Note: The legacy `--history-backend` option is deleted; history storage is unified and automatically resource-tuned.*
 
 ---
 
 ## 8. Verification Suite Specification (`--test`)
 
-The built-in suite MUST be self-contained (no external files). Where the C `lzma` module is available it is used as an oracle; otherwise those cases `skipTest()` and fixed embedded vectors are used. It MUST cover:
-1. **Flexible ISO-8601 Parser**: bare dates, compact notation, optional punctuation, subsecond fractions, known epochs.
-2. **Duration Parser**: `<N>s`, `<N>m`, `0`, fractions.
-3. **Cooperative Timeout**: early termination (~150 ms margin), exit 124, checkpoint written.
-4. **Multi-Stream & RFC Padding**: 0, 4, 8 null bytes; non-multiple-of-4 and non-null padding rejected; padding at EOF accepted.
-5. **Block Header & LZMA2 Property Extraction**: all valid dictionary properties 0–40; property 41+ rejected; `lc+lp > 4` and `v > 224` rejected; non-minimal VLI rejected.
-6. **Block Check Verification**: CRC32, CRC64, SHA-256, None, with tamper detection.
-7. **Index & Stream Footer**: Backward Size, Index CRC32, Footer CRC32, flag symmetry.
-8. **LZMA2 Chunk Rules**: reset semantics for `mode == 3` and `ctrl == 0x01`; first-chunk-must-reset; no props before props; chunk exactness; match crossing chunk end rejected; distance beyond history rejected; `d == 0xFFFFFFFF` rejected.
-9. **Regression: match execution (§2.5)** — all must round-trip against the oracle:
-   a. all-zero input of 10 KB, 100 KB and 3 MB (long rep0 immediately after a literal and at the start of a re-entered block);
-   b. highly repetitive and mixed random/repetitive inputs, every Check type, presets 0, 6, 9e;
-   c. a stream whose first symbol after a block commit is long rep0.
-10. **Regression: backends × block sizes**: every backend (`memory`, `directory`, `file`) × block sizes 4k, 8k, 16k, 64k on multi-block data larger than the dictionary window of the chosen preset.
-11. **Regression: multi-stream routing**: two or three Streams with padding; assert byte-exact contents of `<base>`, `<base>_1`, `<base>_2`; assert no `starting stream` line after the last Stream; assert an empty Stream yields an empty file; assert the boundary-before-next-chunk ordering of §5.4.
-12. **Regression: empty input stream** (`lzma.compress(b'')`): exit 0 and an empty output file.
-13. **Regression: non-seekable input**: decoding from a pipe/generator-backed reader that raises on `tell()`/`seek()`, including checkpoint export.
-14. **Resumption**: (a) Checkpoint-Resume **converges**: decoding a stream whose total time exceeds the timeout, using repeated runs with a short timeout, MUST finish and match the oracle; (b) crash simulation (kill between each of the three journal steps); (c) corrupted/missing journal falls back to Verify-Output; (d) SHA-256 Block resume; (e) Verify-Output mismatch repair and its warning.
-15. **Error mapping**: truncated input, bad magic, `.lzma` input, BCJ filter, reserved Check ID → documented `E_*` identifiers with no traceback.
-16. **Directory store**: eviction at 1025 pages, page append/seal, `truncate_to`, cleanup.
+The self-contained test suite validates:
+1. **Unified Storage Engine**: Single-backend execution across seekable output files and unseekable streams with matching hash verification.
+2. **Ephemeral Buffer View Lifetime**: Assertion that `CHUNK_OUTPUT` views are consumed in-place with zero heap allocations.
+3. **Zero-Allocation Direct-to-Disk Freeze/Thaw**: Verification that `freeze()` and `thaw()` stream binary state directly via `readinto()` without generating Python dictionaries.
+4. **Resumption Convergence**: Multi-pass resumption under tight timeouts converging to bit-exact match with oracle.
+5. **Stream Invariants**: Input read-ahead spooling (zero pipe re-reads) and output stream alignment (zero duplicate stdout writes).
+6. **Pathological Legacy LZMA Paging**: Successful decompression of streams declaring extreme probability tables (`lc=8, lp=4` $	o 6.29	ext{ MiB}$) under simulated low-RAM limits ($\le 128	ext{ KiB}$).
+7. **Cross-Engine Portability**: Tests pass under CPython, PyPy, and MicroPython/CircuitPython shims with no-table CRC code paths.
+8. **Multi-Process Concurrency & Cleanup**: Concurrent streams in `.xz_history` isolate artifacts and automatically unlink the directory when the final stream completes.
 
 ---
 
@@ -404,39 +389,37 @@ The built-in suite MUST be self-contained (no external files). Where the C `lzma
 | Exit Code | Identifier | Description |
 |:---|:---|:---|
 | `0` | `SUCCESS` | Decompression completed successfully; all checksums verified. |
-| `1` | `E_FORMAT` | Invalid magic, corrupt header, illegal or non-minimal VLI, malformed padding, truncated input, invalid LZMA2 chunk sequence, invalid distance, invalid configuration (e.g. illegal block size). |
-| `1` | `E_UNSUPPORTED` | Filter count > 1, non-LZMA2 filter ID, or reserved Check ID. |
-| `1` | `E_CHECK` | Header CRC32, Block Check (CRC32/CRC64/SHA-256), Stream Header/Index/Footer CRC32 mismatch. |
-| `1` | `E_RESOURCE` | Out of memory, insufficient disk space, history capacity exceeded, or failed checkpoint restore in `checkpoint` mode. |
+| `1` | `E_FORMAT` | Invalid magic, corrupt header, illegal VLI, malformed padding, truncated input, invalid chunk sequence, distance overflow, invalid block size. |
+| `1` | `E_UNSUPPORTED`| Filter count > 1, non-LZMA2 filter ID, or reserved Check ID. |
+| `1` | `E_CHECK` | Header CRC32, Block Check (CRC32/CRC64/SHA-256), or Index/Footer CRC32 mismatch. |
+| `1` | `E_RESOURCE` | Out of memory, insufficient storage space, or failed checkpoint restore. |
 | `1` | `E_IO` | File read/write failure, broken pipe, or directory permission error. |
 | `124` | `E_DEADLINE` | Wall-clock timeout, absolute deadline, or CPU timeout reached. |
 | `130` | `SIGINT` | Interrupted by keyboard interrupt (`Ctrl+C`). |
 
 ---
 
-## Appendix A — Changes from Revision 7 to Revision 8
+## Appendix A - Changes Across Revisions
 
-| # | Change | Reason (empirically verified against Rev 7 baseline) |
+### Changes from Revision 10 to Revision 11
+| # | Change | Reason (empirically verified against Rev 10 baseline) |
 |:---|:---|:---|
-| 1 | §2.2, §2.4: 514-entry length-coder probability tables (mid at 130 + (pos_state << 3), high at 258) | Fixes `pb=4` decoding failures in both XZ and LZMA formats (previously sized for 8 pos_states instead of 16). |
-| 2 | §5.5: Full LZMA_Alone container support & strict `liblzma` header verification | Resolves silent exit on truncated streams, overly loose format detection, and props=0x00 failure. |
-| 3 | §5.5: Mandatory EOF and truncation detection in LZMA streams | Prevents infinite zero-padding on premature input exhaustion in known-size streams. |
-| 4 | §5.5: Trailing-byte validation after `.lzma` streams | Trailing garbage or orphan null bytes rejected with `E_FORMAT`; valid concatenated XZ/LZMA streams transition cleanly. |
-| 5 | §5.5: 0-byte input rejection | Empty input raises `E_FORMAT` (exit 1), matching standard `xz` behavior. |
-| 6 | §3.2: Document `SeekableOutputFileHistory`, preflight disk check, and `_PathFallback` | Reconciles ratified specification with hardened runtime-adaptive features. |
+| 1 | §2.1: Three-tier adaptive block sizing (512 B, 8192 B, 65536 B) based purely on RAM | Enforces 512-byte blocks when RAM $< 64	ext{ KiB}$, 8192-byte blocks when RAM $< 1	ext{ MiB}$, and 65536-byte blocks otherwise. Overrides strictly restricted to `{512, 8192, 65536}`. Enables postage-stamp microcontrollers to decompress extreme `lzma -9e` streams bit-perfectly. |
+| 2 | §2.1, §2.4: Zero closure creation and RangeDecoder reuse in decoding loop | Eradicates per-chunk `_rd_get`, `_vli`, and `RangeDecoder` allocations in `decode_block()`. Renormalization indexes chunk buffers directly via `pos < limit`. |
+| 3 | §2.5: Constant immutable `_LIT_TRANS` bytes literal | Replaces per-literal 12-element list allocations with constant `b"\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x04\x05"`, eliminating over 70 million allocations on 71.8 MB streams. |
+| 4 | §2.3: Pure-RAM CRC64 determination at startup | Eliminates engine-sniffing (`_is_embedded_python`). Evaluates available RAM once at startup: uses 256-entry table lookup whenever RAM $\ge 64	ext{ KiB}$ (eliminating 568 million bitwise shift iterations), and bitwise loop when RAM $< 64	ext{ KiB}$. |
+| 5 | §3.3, §3.4: Standalone `.inbuf` and `.hbuf` with safe generational sharing | `.inbuf` and `.hbuf` remain external standalone files. Consecutive state iterations safely share them until the subsequent iteration commits and prunes obsolete earlier versions. |
 
-## Appendix B — Prior Changes from Revision 6
+### Changes from Revision 8 to Revision 9
 
-| # | Change | Reason (empirically verified against the Rev 6 WIP) |
+| # | Change | Reason (empirically verified against Rev 8 baseline) |
 |:---|:---|:---|
-| 1 | New §2.5 (distance binding, re-entrancy) + regression tests | Long rep0 left `d` unbound → `UnboundLocalError` on any all-zero/highly repetitive stream |
-| 2 | §3.2A page-based store; §2.1.1 block-size rule | Directory store assumed 64 KiB blocks; 4k/8k/16k corrupted output (CRC64 mismatch) |
-| 3 | §5.1, §5.4 boundary ordering, `has_next`, output-on-stream-start | Stream N+1 data was written into Stream N's file; phantom "starting stream" line; empty stream produced no file |
-| 4 | §3.3.2 offsets tracked by engine; `tell()` not required | Non-seekable input crashed at first block commit (`Illegal seek`) |
-| 5 | §3.3 checkpoint-based resumption (**decision**: new default under `--resume-dir`; Verify-Output retained as fallback with documented limitation) | Verify-Output cannot converge when decode time exceeds the timeout (progress plateaued across repeated runs) |
-| 6 | §2.2 property byte not masked; reserved values rejected; VLI minimality; padding zero checks | Spec/WIP masked `p & 0x3F`; several malformed inputs were accepted |
-| 7 | §2.4 full chunk header layout and validity state machine | Spec lacked the layout; WIP didn't enforce first-chunk-reset / need-props / chunk exactness |
-| 8 | §5.0 Stream Header section | Header parsing rules were missing from the spec |
-| 9 | §6 failure behavior (retain `.part` on data errors, `verified_output_offset`) (**decision**) | Partial output is valuable for recovery in preservation workflows |
-| 10 | §4.2 spinner only on a TTY; §7 error mapping without tracebacks | Spinner glyphs polluted redirected stderr; errors surfaced as raw tracebacks |
-| 11 | §8 expanded regression suite | Rev 6 suite (26 tests) passed while all of the above defects were present |
+| 1 | §3.1: Single Unified History Engine (`UnifiedHistory`) replacing 4 legacy backends | Resolves the 70% throughput regression; eliminates integer division, dict hashing, and generator overhead by using a fast hot RAM ring buffer backed by the seekable output file or sequential scratch file. |
+| 2 | §7: Complete deletion of `--history-backend` CLI flag | Eliminates configuration traps and redundant branching; storage tiering is 100% automatic based on destination seekability and RAM budget. |
+| 3 | §3.3: Direct-to-disk binary Freeze/Thaw using `readinto()` | Replaces dictionary-based `export_state`/`import_state` (which allocated 49 KiB-12.6 MiB heap strings), achieving true zero-allocation persistence and eliminating OOM on microcontrollers. |
+| 4 | §3.2: Pluggable `TransientStorage` VFS (`DiskStorage` default, `MemoryStorage` virtual disk) | Decouples storage mechanisms from engine logic, enabling zero-disk-hop execution in memory or serverless containers. |
+| 5 | §2.1.2: Normative Ephemeral Buffer View Lifetime Contract | Formally specifies that `CHUNK_OUTPUT` views are valid only between `yield` and generator re-entry, allowing true zero-allocation streaming from RangeDecoder to `file.write()`. |
+| 6 | §4.3: Decoupled Resume State & Seekable File Omission Matrix | Replaces disconnected internal tokens with `ResumeDescriptor` mapping 1:1 with CLI `--resume-*` flags. Omits `--resume-id`, `--resume-from`, and `--resume-at` for seekable files while always printing `--resume-dir`. |
+| 7 | §3.4: Unseekable Input Spooling (`.in_spool`) & Output Alignment | Guarantees zero re-reading of upstream pipes and zero re-writing of downstream stdout streams across crash and timeout resumption. |
+| 8 | §3.5: Extreme Microcontroller Scaling down to ~20 KiB RAM | Incorporates 4 KiB block buffers, in-place logarithmic doubling match copies, 1.5 KiB paged sub-tables for pathological legacy LZMA, and capability-gated low-watermark GC (`_gc_mem_free`). |
+| 9 | §2.3, §3.5: Shadow-Proof ROM-First CRC32 Probing & Heap Cushion | Probes `ubinascii` before `binascii` to resist `mip` filesystem shadowing; implements nested `try/finally` memory cushion for safe OOM traceback printing. |
