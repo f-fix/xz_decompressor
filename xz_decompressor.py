@@ -901,11 +901,11 @@ def select_block_size(block_size_choice="auto", available_mem=None):
 
     # Sizing thresholds:
     # 512 bytes: constrained microcontrollers (< 96 KiB free RAM)
-    # 8192 bytes: intermediate microcontroller heaps (< 256 KiB free RAM)
-    # 65536 bytes: standard environments (>= 256 KiB free RAM, e.g. MicroPython default 902 KiB heap)
+    # 8192 bytes: intermediate microcontroller heaps (< 512 KiB free RAM)
+    # 65536 bytes: standard environments (>= 512 KiB free RAM, e.g. 768k/1m heaps and desktop)
     if available_mem < 96 * 1024:
         return _BS_MICRO
-    if available_mem < 256 * 1024:
+    if available_mem < 512 * 1024:
         return _BS_MID
     return _BS_LARGE
 
@@ -1269,22 +1269,22 @@ class UnifiedHistory(HistoryBackend):
         if b_len == 0:
             return
 
-        b = bytes(block_data)
-        self.blocks.append(b)
-        self.blocks_len += b_len
-
-        # Rotate blocks: pop oldest block when memory limit reached (zero memory reallocation spikes!)
         max_b = (
             (self.max_history // self.block_size)
             if self.in_ram_only
             else self.max_blocks
         )
         limit = self.max_history if self.in_ram_only else self.ram_cache_bytes
-        while len(self.blocks) > 1 and (
-            len(self.blocks) > max_b or self.blocks_len > limit
+        # Free oldest block FIRST before allocating the new block to return contiguous memory to heap
+        while self.blocks and (
+            len(self.blocks) >= max_b or (self.blocks_len + b_len) > limit
         ):
             dropped = self.blocks.pop(0)
             self.blocks_len -= len(dropped)
+
+        b = bytes(block_data)
+        self.blocks.append(b)
+        self.blocks_len += b_len
 
         # Mode B: Write to scratch file ONLY when output_file is None/unseekable!
         if self.output_file is None and self.storage is not None:
@@ -5736,10 +5736,10 @@ class TestXZDecompressor(_TestCaseBase):
         self.assertIsNone(parse_duration(None))
 
     def test_storage_auto_block_size_threshold(self):
-        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 256 KiB RAM), 65536 bytes otherwise
+        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 512 KiB RAM), 65536 bytes otherwise
         micro_mem = 64 * 1024  # 64KB (< 96KB)
-        mid_mem = 128 * 1024  # 128KB (< 256KB)
-        norm_mem = 10 * 1024 * 1024  # 10MB (>= 256KB)
+        mid_mem = 256 * 1024  # 256KB (< 512KB)
+        norm_mem = 10 * 1024 * 1024  # 10MB (>= 512KB)
 
         self.assertEqual(select_block_size("auto", available_mem=micro_mem), 512)
         self.assertEqual(select_block_size("auto", available_mem=mid_mem), 8192)
@@ -6562,13 +6562,13 @@ class TestXZDecompressor(_TestCaseBase):
         self.assertEqual(bytes(out), raw)
 
     def test_allowed_block_size_enforcement(self):
-        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 256 KiB RAM), 65536 bytes otherwise
+        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 512 KiB RAM), 65536 bytes otherwise
         self.assertEqual(select_block_size("auto", available_mem=32 * 1024), 512)
         self.assertEqual(select_block_size("auto", available_mem=64 * 1024), 512)
         self.assertEqual(select_block_size("auto", available_mem=95 * 1024), 512)
         self.assertEqual(select_block_size("auto", available_mem=96 * 1024), 8192)
-        self.assertEqual(select_block_size("auto", available_mem=255 * 1024), 8192)
-        self.assertEqual(select_block_size("auto", available_mem=256 * 1024), 65536)
+        self.assertEqual(select_block_size("auto", available_mem=511 * 1024), 8192)
+        self.assertEqual(select_block_size("auto", available_mem=512 * 1024), 65536)
         self.assertEqual(
             select_block_size("auto", available_mem=16 * 1024 * 1024), 65536
         )
