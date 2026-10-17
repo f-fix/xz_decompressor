@@ -2358,12 +2358,13 @@ class XZStreamDecompressor:
         self.stream_out_offset += len(committed)
         self.block_idx += 1
         self.cur_block_pos = 0
-        if self.force_gc:
+        # Avoid a full collection on every small output block.  On MicroPython
+        # postage-stamp heaps, check only once per 16 committed blocks and collect
+        # only when the heap is genuinely low.  This follows the Rev. 12 spec and
+        # avoids turning 512-byte blocks into a GC call every 512 output bytes.
+        if self.force_gc and (self.block_idx & 15) == 0:
             try:
-                if hasattr(gc, "mem_free"):
-                    if gc.mem_free() < 65536:
-                        gc.collect()
-                else:
+                if _gc_mem_free is not None and _gc_mem_free() < 4096:
                     gc.collect()
             except Exception:
                 pass
@@ -3193,6 +3194,8 @@ class XZStreamDecompressor:
                                         self.stream_out_offset += len(committed)
                                         self.block_idx += 1
                                         self.cur_block_pos = 0
+                                        if self.force_gc and (self.block_idx & 15) == 0:
+                                            _maybe_collect(4096)
                                         self.rd_code = rd.code
                                         self.rd_range = rd.range
                                         if rd.buf is not None:
@@ -3273,11 +3276,6 @@ class XZStreamDecompressor:
 
                                 if self.cur_block_pos == self.block_size:
                                     committed = self._commit_block()
-                                    if self.force_gc:
-                                        try:
-                                            gc.collect()
-                                        except Exception:
-                                            pass
                                     self.rd_code = rd.code
                                     self.rd_range = rd.range
                                     if rd.buf is not None:
