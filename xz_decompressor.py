@@ -20,7 +20,16 @@ _gc_mem_free = getattr(gc, "mem_free", None)
 _PROB_INIT_ELEMENT = struct.pack("<H", 1024)
 
 
+_IS_DESKTOP_PY = getattr(
+    sys, "implementation", None
+) is not None and sys.implementation.name in ("cpython", "pypy")
+
+
 def _make_prob_array(count):
+    if _IS_DESKTOP_PY:
+        # array.array is JIT-friendly on PyPy (memoryview item access is not)
+        # and at least as fast as a cast memoryview on CPython.
+        return array.array("H", [1024]) * count
     # Preallocate exact bytearray and fill via logarithmic doubling (zero allocation spikes, zero list creation)
     ba = bytearray(count * 2)
     ba[0] = 0
@@ -38,6 +47,9 @@ def _make_prob_array(count):
 
 
 def _reset_prob_array(arr):
+    if _IS_DESKTOP_PY and isinstance(arr, array.array):
+        arr[:] = array.array("H", [1024]) * len(arr)
+        return
     # Reset existing probability array in-place with zero heap allocations
     buf = getattr(arr, "obj", None)
     if isinstance(buf, bytearray):
@@ -1495,6 +1507,55 @@ class RangeDecoder:
         return symbol
 
     @micropython.native
+    def decode_literal(self, probs, off, mb):
+        # mb < 0: plain literal; mb >= 0: matched literal using match byte mb
+        rng = self.range
+        code = self.code
+        buf = self.buf
+        pos = self.pos
+        limit = self.limit
+        symbol = 1
+        while symbol < 0x100:
+            if mb >= 0:
+                mbit = (mb >> 7) & 1
+                mb = (mb << 1) & 0xFF
+                idx = off + ((1 + mbit) << 8) + symbol
+            else:
+                idx = off + symbol
+            prob = probs[idx]
+            bound = (rng >> 11) * prob
+            if code < bound:
+                rng = bound
+                probs[idx] = prob + ((2048 - prob) >> 5)
+                symbol = symbol << 1
+                if mb >= 0 and mbit != 0:
+                    mb = -1
+            else:
+                rng -= bound
+                code -= bound
+                probs[idx] = prob - (prob >> 5)
+                symbol = (symbol << 1) + 1
+                if mb >= 0 and mbit != 1:
+                    mb = -1
+            if rng < 0x01000000:
+                rng = rng << 8
+                if pos < limit:
+                    b = buf[pos]
+                    pos += 1
+                elif self.read_byte is not None:
+                    b = self.read_byte()
+                    buf = self.buf
+                    pos = self.pos
+                    limit = self.limit
+                else:
+                    b = 0
+                code = ((code << 8) | b) & 0xFFFFFFFF
+        self.range = rng
+        self.code = code
+        self.pos = pos
+        return symbol - 0x100
+
+    @micropython.native
     def decode_direct_bits(self, num_bits):
         val = 0
         for _ in range(num_bits):
@@ -1578,7 +1639,6 @@ class XZStreamDecompressor:
         self.stream_out_offset = 0
         self.block_idx = 0
         self.stream_index = 0
-        self.input_hasher = hashlib.sha256()
 
         self.phase = "STREAM_HEADER"
         self.null_count = 0
@@ -1675,13 +1735,11 @@ class XZStreamDecompressor:
                 raise EOFError(f"Unexpected EOF: expected {n} bytes, got {pos}")
             self.overall_input_offset += n
             res = bytes(self._exact_buf[:n])
-            self.input_hasher.update(res)
             return res
         res_b = self.input.read(n)
         if len(res_b) < n:
             raise EOFError(f"Unexpected EOF: expected {n} bytes, got {len(res_b)}")
         self.overall_input_offset += n
-        self.input_hasher.update(res_b)
         return res_b
 
     def _read_vli_from_buf(self, buf, off):
@@ -1715,7 +1773,6 @@ class XZStreamDecompressor:
         if not ib:
             raise EOFError("Unexpected EOF reading compressed stream")
         self.overall_input_offset += 1
-        self.input_hasher.update(ib)
         return ib[0]
 
     def _refill_chunk_byte(self):
@@ -1731,7 +1788,6 @@ class XZStreamDecompressor:
         if not chunk:
             return 0
         self.overall_input_offset += len(chunk)
-        self.input_hasher.update(chunk)
         self.compressed_bytes_in_block += len(chunk)
         self.chunk_comp_rem -= len(chunk)
         self.chunk_stream_buf = chunk
@@ -2253,7 +2309,6 @@ class XZStreamDecompressor:
                             raise XZFormatError("Stream padding not multiple of 4")
                         self.phase = "EOF"
                         return b"", True
-                    self.input_hasher.update(b)
 
                     if self.overall_input_offset == 1 and self.stream_index == 0:
                         if b == b"\xfd":
@@ -2285,7 +2340,6 @@ class XZStreamDecompressor:
                                 "Unexpected EOF reading LZMA range decoder header"
                             )
                         self.overall_input_offset += 1
-                        self.input_hasher.update(rc_first)
                         if rc_first[0] != 0:
                             raise XZFormatError(
                                 f"First byte of LZMA range decoder must be 0x00, got 0x{rc_first[0]:02x}"
@@ -2363,7 +2417,6 @@ class XZStreamDecompressor:
                                 "Invalid range coder init in legacy LZMA stream"
                             )
                         self.overall_input_offset += 1
-                        self.input_hasher.update(rc_first)
                         self.pb = pbyte // 45
                         rem = pbyte % 45
                         self.lp = rem // 9
@@ -2520,7 +2573,6 @@ class XZStreamDecompressor:
                                 << self.lc
                             ) + (prev_b >> (8 - self.lc))
                             lit_off = lit_st * 0x300
-                            symbol = 1
                             if self.state >= 7:
                                 dist = self.reps[0]
                                 if dist < self.cur_block_pos:
@@ -2534,20 +2586,10 @@ class XZStreamDecompressor:
                                         mb = ms[0] if ms else 0
                                     else:
                                         mb = 0
-                                while symbol < 0x100:
-                                    mbit = (mb >> 7) & 1
-                                    mb = (mb << 1) & 0xFF
-                                    bit = rd.decode_bit(
-                                        self.p_lit, lit_off + ((1 + mbit) << 8) + symbol
-                                    )
-                                    symbol = (symbol << 1) | bit
-                                    if mbit != bit:
-                                        break
-                            while symbol < 0x100:
-                                symbol = (symbol << 1) | rd.decode_bit(
-                                    self.p_lit, lit_off + symbol
-                                )
-                            self.cur_block[self.cur_block_pos] = symbol - 0x100
+                                symbol = rd.decode_literal(self.p_lit, lit_off, mb)
+                            else:
+                                symbol = rd.decode_literal(self.p_lit, lit_off, -1)
+                            self.cur_block[self.cur_block_pos] = symbol
                             self.cur_block_pos += 1
                             self.state = _LIT_TRANS[self.state]
 
@@ -2957,7 +2999,6 @@ class XZStreamDecompressor:
                                     self.chunk_comp_rem
                                 )
                                 self.overall_input_offset += len(self.chunk_stream_buf)
-                                self.input_hasher.update(self.chunk_stream_buf)
                                 self.compressed_bytes_in_block += len(
                                     self.chunk_stream_buf
                                 )
@@ -3003,7 +3044,6 @@ class XZStreamDecompressor:
                                     self.chunk_comp_rem
                                 )
                                 self.overall_input_offset += len(self.chunk_stream_buf)
-                                self.input_hasher.update(self.chunk_stream_buf)
                                 self.compressed_bytes_in_block += len(
                                     self.chunk_stream_buf
                                 )
@@ -3107,7 +3147,6 @@ class XZStreamDecompressor:
                                     << self.lc
                                 ) + (prev_b >> (8 - self.lc))
                                 lit_off = lit_st * 0x300
-                                symbol = 1
                                 if self.state >= 7:
                                     dist = self.reps[0]
                                     if dist < self.cur_block_pos:
@@ -3123,21 +3162,10 @@ class XZStreamDecompressor:
                                             mb = ms[0] if ms else 0
                                         else:
                                             mb = 0
-                                    while symbol < 0x100:
-                                        mbit = (mb >> 7) & 1
-                                        mb = (mb << 1) & 0xFF
-                                        bit = rd.decode_bit(
-                                            self.p_lit,
-                                            lit_off + ((1 + mbit) << 8) + symbol,
-                                        )
-                                        symbol = (symbol << 1) | bit
-                                        if mbit != bit:
-                                            break
-                                while symbol < 0x100:
-                                    symbol = (symbol << 1) | rd.decode_bit(
-                                        self.p_lit, lit_off + symbol
-                                    )
-                                self.cur_block[self.cur_block_pos] = symbol - 0x100
+                                    symbol = rd.decode_literal(self.p_lit, lit_off, mb)
+                                else:
+                                    symbol = rd.decode_literal(self.p_lit, lit_off, -1)
+                                self.cur_block[self.cur_block_pos] = symbol
                                 self.cur_block_pos += 1
                                 self.chunk_decoded += 1
                                 self.state = _LIT_TRANS[self.state]
