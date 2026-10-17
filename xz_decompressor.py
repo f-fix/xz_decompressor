@@ -1319,35 +1319,45 @@ class UnifiedHistory(HistoryBackend):
         start_pos = self.total_written - distance
         blocks_start = self.total_written - self.blocks_len
 
-        # Tier 1: Lookback in rotating blocks in RAM
+        # Tier 1: Lookback in rotating blocks in RAM (O(1) direct block indexing)
         if start_pos >= blocks_start:
             rel_offset = start_pos - blocks_start
-            if len(self.blocks) == 1:
+            n_blocks = len(self.blocks)
+            if n_blocks == 1:
                 return self.blocks[0][rel_offset : rel_offset + length]
-            cur = 0
-            for idx, blk in enumerate(self.blocks):
-                blk_sz = len(blk)
-                if cur + blk_sz > rel_offset:
-                    in_blk = rel_offset - cur
-                    avail = blk_sz - in_blk
-                    if avail >= length:
-                        return blk[in_blk : in_blk + length]
-                    else:
-                        # Spans across blocks - copy into pre-allocated slice buffer (zero extend(), zero heap allocations)
-                        buf = self._slice_buf
-                        buf[:avail] = blk[in_blk:]
-                        buf_pos = avail
-                        rem = length - avail
-                        next_idx = idx + 1
-                        while rem > 0 and next_idx < len(self.blocks):
-                            nxt = self.blocks[next_idx]
-                            take = min(rem, len(nxt))
-                            buf[buf_pos : buf_pos + take] = nxt[:take]
-                            buf_pos += take
-                            rem -= take
-                            next_idx += 1
-                        return bytes(buf[:length])
-                cur += blk_sz
+
+            b_size = self.block_size
+            first_sz = len(self.blocks[0])
+            if first_sz == b_size:
+                idx = rel_offset // b_size
+                in_blk = rel_offset % b_size
+            elif rel_offset < first_sz:
+                idx = 0
+                in_blk = rel_offset
+            else:
+                adj = rel_offset - first_sz
+                idx = 1 + (adj // b_size)
+                in_blk = adj % b_size
+
+            if idx < n_blocks:
+                blk = self.blocks[idx]
+                avail = len(blk) - in_blk
+                if avail >= length:
+                    return blk[in_blk : in_blk + length]
+                else:
+                    buf = self._slice_buf
+                    buf[:avail] = blk[in_blk:]
+                    buf_pos = avail
+                    rem = length - avail
+                    next_idx = idx + 1
+                    while rem > 0 and next_idx < n_blocks:
+                        nxt = self.blocks[next_idx]
+                        take = min(rem, len(nxt))
+                        buf[buf_pos : buf_pos + take] = nxt[:take]
+                        buf_pos += take
+                        rem -= take
+                        next_idx += 1
+                    return bytes(buf[:length])
 
         # Tier 2: Cold store lookback
         # Mode A: Seekable output file (ZERO .hist file used!)
@@ -1509,20 +1519,29 @@ class RangeDecoder:
         self.limit = len(buf) if buf is not None else 0
 
     @micropython.native
-    def decode_bit(self, probs, index):
+    def decode_bit(
+        self,
+        probs,
+        index,
+        _pb=_PROB_BITS,
+        _pm=_PROB_MOVE_BITS,
+        _pt=_PROB_TOTAL,
+        _top=_RC_TOP_MASK,
+        _mask=_RC_TOTAL_RANGE,
+    ):
         prob = probs[index]
-        bound = (self.range >> _PROB_BITS) * prob
+        bound = (self.range >> _pb) * prob
         if self.code < bound:
             self.range = bound
-            probs[index] = prob + ((_PROB_TOTAL - prob) >> _PROB_MOVE_BITS)
+            probs[index] = prob + ((_pt - prob) >> _pm)
             bit = 0
         else:
-            self.range = (self.range - bound) & _RC_TOTAL_RANGE
-            self.code = (self.code - bound) & _RC_TOTAL_RANGE
-            probs[index] = prob - (prob >> _PROB_MOVE_BITS)
+            self.range = (self.range - bound) & _mask
+            self.code = (self.code - bound) & _mask
+            probs[index] = prob - (prob >> _pm)
             bit = 1
-        if self.range < _RC_TOP_MASK:
-            self.range = (self.range << 8) & _RC_TOTAL_RANGE
+        if self.range < _top:
+            self.range = (self.range << 8) & _mask
             if self.pos < self.limit:
                 b = self.buf[self.pos]
                 self.pos += 1
@@ -1530,7 +1549,7 @@ class RangeDecoder:
                 b = self.read_byte()
             else:
                 b = 0
-            self.code = ((self.code << 8) | b) & _RC_TOTAL_RANGE
+            self.code = ((self.code << 8) | b) & _mask
         return bit
 
     @micropython.native
@@ -1600,19 +1619,19 @@ class RangeDecoder:
         return symbol - 0x100
 
     @micropython.native
-    def decode_direct_bits(self, num_bits):
+    def decode_direct_bits(self, num_bits, _top=_RC_TOP_MASK, _mask=_RC_TOTAL_RANGE):
         val = 0
         for _ in range(num_bits):
             self.range >>= 1
-            self.code = (self.code - self.range) & _RC_TOTAL_RANGE
+            self.code = (self.code - self.range) & _mask
             if (self.code >> 31) & 1:
-                self.code = (self.code + self.range) & _RC_TOTAL_RANGE
+                self.code = (self.code + self.range) & _mask
                 bit = 0
             else:
                 bit = 1
             val = (val << 1) | bit
-            if self.range < _RC_TOP_MASK:
-                self.range = (self.range << 8) & _RC_TOTAL_RANGE
+            if self.range < _top:
+                self.range = (self.range << 8) & _mask
                 if self.pos < self.limit:
                     b = self.buf[self.pos]
                     self.pos += 1
@@ -1620,7 +1639,7 @@ class RangeDecoder:
                     b = self.read_byte()
                 else:
                     b = 0
-                self.code = ((self.code << 8) | b) & _RC_TOTAL_RANGE
+                self.code = ((self.code << 8) | b) & _mask
         return val
 
 
@@ -1668,6 +1687,7 @@ class XZStreamDecompressor:
         )
         self.block_size = block_size
         self.wb_blocks = wb_blocks if wb_blocks is not None else 1
+        self.wb_flush_interval = 2.0
         if self.wb_blocks > 1:
             self.wb_buffer = bytearray(self.wb_blocks * self.block_size)
             self.wb_pos = 0
@@ -2620,6 +2640,7 @@ class XZStreamDecompressor:
                                 << self.lc
                             ) + (prev_b >> (8 - self.lc))
                             lit_off = lit_st * 0x300
+                            symbol = 1
                             if self.state >= 7:
                                 dist = self.reps[0]
                                 if dist < self.cur_block_pos:
@@ -2633,10 +2654,21 @@ class XZStreamDecompressor:
                                         mb = ms[0] if ms else 0
                                     else:
                                         mb = 0
-                                symbol = rd.decode_literal(self.p_lit, lit_off, mb)
-                            else:
-                                symbol = rd.decode_literal(self.p_lit, lit_off, -1)
-                            self.cur_block[self.cur_block_pos] = symbol
+                                while symbol < 0x100:
+                                    mbit = (mb >> 7) & 1
+                                    mb = (mb << 1) & 0xFF
+                                    bit = rd.decode_bit(
+                                        self.p_lit,
+                                        lit_off + ((1 + mbit) << 8) + symbol,
+                                    )
+                                    symbol = (symbol << 1) | bit
+                                    if mbit != bit:
+                                        break
+                            while symbol < 0x100:
+                                symbol = (symbol << 1) | rd.decode_bit(
+                                    self.p_lit, lit_off + symbol
+                                )
+                            self.cur_block[self.cur_block_pos] = symbol - 0x100
                             self.cur_block_pos += 1
                             self.state = _LIT_TRANS[self.state]
 
@@ -3579,7 +3611,10 @@ class XZStreamDecompressor:
                         self.wb_block_count >= self.wb_blocks
                         or is_eof
                         or (self.pending_boundary is not None)
-                        or (now - self.last_wb_flush >= 2.0)
+                        or (
+                            self.wb_flush_interval is not None
+                            and now - self.last_wb_flush >= self.wb_flush_interval
+                        )
                     ):
                         yield from self._flush_wb()
                 else:
@@ -5140,6 +5175,7 @@ class TestXZDecompressor(_TestCaseBase):
         eng_wb = XZStreamDecompressor(
             io.BytesIO(xz_data), block_size=65536, wb_blocks=16
         )
+        eng_wb.wb_flush_interval = None
         wb_chunks = [
             len(ev.data)
             for ev in eng_wb.decode_events()
@@ -5152,6 +5188,7 @@ class TestXZDecompressor(_TestCaseBase):
         eng_full = XZStreamDecompressor(
             io.BytesIO(xz_data), block_size=65536, wb_blocks=16
         )
+        eng_full.wb_flush_interval = None
         full_out = b"".join(
             bytes(ev.data)
             for ev in eng_full.decode_events()
@@ -6727,6 +6764,7 @@ def main():
     spin_idx = [0]
     last_spin_time = [_get_perf_counter()]
     last_spin_bytes = [0]
+    last_status_print_time = [0.0]
     out_is_stdout = output_dst == "-"
     stderr_has_isatty = hasattr(sys.stderr, "isatty")
     spinner_active = [False]
@@ -6736,11 +6774,15 @@ def main():
 
     def progress_cb(ev):
         now = _get_perf_counter()
+        # Inhibit printing if the most recent previous status print for this stream was < 500ms earlier
+        if (now - last_status_print_time[0]) < 0.500:
+            return
         dt = now - last_spin_time[0]
         db = ev.total_emitted - last_spin_bytes[0]
         rate = (db / dt) if dt > 0 else 0.0
         last_spin_time[0] = now
         last_spin_bytes[0] = ev.total_emitted
+        last_status_print_time[0] = now
 
         glyph = spinner[spin_idx[0] % len(spinner)]
         spin_idx[0] += 1
