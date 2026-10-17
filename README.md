@@ -3,7 +3,7 @@ Pure-Python XZ / LZMA2 Streaming Decompressor with Resumption
 
 Target Environments: MicroPython, CircuitPython, PyPy 3, CPython 3.8+, GraalPy, RustPython, PyEmscripten
 Authoritative Standard: The .xz File Format Specification (v1.2.0 / RFC §2 & §3)
-Revision: 11 (Three-tier block sizing [512 B, 8 KiB, 64 KiB] based purely on available RAM, zero-closure inner-loop execution, immutable _LIT_TRANS bytes literal, pure-RAM startup CRC64 determination, and standalone .inbuf/.hbuf generational sharing; see Appendix A)
+Revision: 12 (GitHub Flavored Markdown [GFM] compliance, elimination of unrendered LaTeX math syntax, three-tier memory sizing [512 B, 8 KiB, 64 KiB], zero-closure inner loop, and standalone .inbuf/.hbuf generational sharing; see Appendix A)
 
 ---
 
@@ -64,9 +64,9 @@ This specification defines the architecture, wire protocols, integrity verificat
 
 ### 2.1 The Active Working Block Buffer (`cur_block`) & Ephemeral Views
 1. **Buffer Allocation**: The decompressor allocates `cur_block = bytearray(block_size)`. `block_size` MUST be one of the three allowable sizes: **512 bytes**, **8192 bytes** (8 KiB), or **65536 bytes** (64 KiB). Sizing is determined automatically based purely on available system RAM without engine-sniffing:
-   - **512 bytes**: When available RAM $< 64	ext{ KiB}$ (enabling postage-stamp microcontrollers to decompress extreme `lzma -9e` streams bit-perfectly).
-   - **8192 bytes**: When available RAM $< 1	ext{ MiB}$.
-   - **65536 bytes**: Standard operating environments with $\ge 1	ext{ MiB}$ RAM.
+   - **512 bytes**: When available RAM < 96 KiB (enabling postage-stamp microcontrollers to decompress extreme `lzma -9e` streams bit-perfectly down to ~24 KiB free heap).
+   - **8192 bytes**: When available RAM < 256 KiB.
+   - **65536 bytes**: Standard operating environments with >= 256 KiB RAM.
    Any override supplied via CLI (`--block-size`) or API MUST be exactly one of `{512, 8192, 65536}`; all other values are rejected (`E_FORMAT`, exit 1). Buffer allocation occurs strictly once at initialization; buffers are never reallocated or deallocated inside the decoding loop.
 2. **Ephemeral Buffer View Lifetime Contract (Normative)**:
    - When `CHUNK_OUTPUT` is yielded by the iterator protocol, `event.data` exposes `memoryview(cur_block)[:pos]`.
@@ -95,14 +95,16 @@ This specification defines the architecture, wire protocols, integrity verificat
 ### 2.1.3 Resource-Adaptive Write-Back Cache
 To eliminate per-block system call overhead (`f.write()`, `f.flush()`, event generator context switches, and terminal I/O) on fast runtimes while strictly preserving microcontroller memory bounds:
 1. **Adaptive Sizing Matrix**:
-   $$\text{wb\_blocks} = \max\left(1, \min\left(16, \text{int}\left(\frac{\text{avail\_mem} \times 0.20}{\text{block\_size}}\right)\right)\right)$$
-   - Desktop / Server (RAM $\ge 32\text{ MiB}$): Allocates a preallocated write-back buffer of 16 blocks (1 MiB when `block_size = 64 KiB`).
-   - Microcontrollers (RAM $\le 256\text{ KiB}$): Automatically sets `wb_blocks = 1` (immediate write-through mode, allocating **0 bytes** of write-back buffer).
+   ```text
+   wb_blocks = max(1, min(16, int((avail_mem * 0.20) // block_size)))
+   ```
+   - Desktop / Server (RAM >= 32 MiB): Allocates a preallocated write-back buffer of 16 blocks (1 MiB when `block_size = 64 KiB`).
+   - Microcontrollers (RAM <= 256 KiB): Automatically sets `wb_blocks = 1` (immediate write-through mode, allocating **0 bytes** of write-back buffer).
 2. **Four Deterministic Flush Triggers**:
    Accumulated blocks are flushed and yielded downstream if and only if:
    a. **Buffer Full**: Exactly `wb_blocks` blocks have accumulated (e.g. 1 MiB batch).
    b. **Stream End**: EOF or an explicit `STREAM_BOUNDARY` is reached.
-   c. **Wall-Clock Inactivity**: $> 2.0\text{ seconds}$ have elapsed since the last flush.
+   c. **Wall-Clock Inactivity**: > 2.0 seconds have elapsed since the last flush.
    d. **Process Termination**: `atexit` hook, SIGINT (`Ctrl+C`), or timeout deadline trigger.
 3. **Yielding & Terminal Telemetry**:
    In write-back mode, `CHUNK_OUTPUT`, `BLOCK_COMMITTED`, and `PROGRESS` events are emitted at write-back flush boundaries. Downstream file writing and terminal status indicators (braille spinner) advance in **1 MiB increments** (or once every 2s (aligned with FAT32 2-second timestamp resolution)), eliminating over 94% of system call overhead.
@@ -110,7 +112,7 @@ To eliminate per-block system call overhead (`f.write()`, `f.flush()`, event gen
 4. **Terminal Status Line Format**:
    When active, the progress callback updates the terminal in the format:
    `{glyph} {time_field} {size_field} decoded, {rate_field}`
-   - `time_field`: Fixed-width (10 characters). Displays cumulative elapsed time across sessions formatted via `str(datetime.timedelta)` when the `datetime` module is available, or `NNNNs` (seconds followed by "s") elsewhere. If total elapsed time reaches the `uint32` maximum ($4,294,967,295$ ms $\approx 49.7$ days), it is clamped and displayed as all spaces.
+   - `time_field`: Fixed-width (10 characters). Displays cumulative elapsed time across sessions formatted via `str(datetime.timedelta)` when the `datetime` module is available, or `NNNNs` (seconds followed by "s") elsewhere. If total elapsed time reaches the `uint32` maximum (4,294,967,295 ms, approximately 49.7 days), it is clamped and displayed as all spaces.
    - Status eraser line is widened to 56 characters to fully clear the elapsed time indicator.
 
 ### 2.2 Normative Block Header Parsing & Validation
@@ -133,7 +135,7 @@ Every Block begins with a Block Header (XZ spec §3.1). A first byte of `0x00` i
 ### 2.3 Mandatory Block Check Verification & Pre-Allocation
 1. **Check Type**: Bits 0-3 of Stream Flags byte 2. Sizes: `0x00`→0, `0x01`→4, `0x04`→8, `0x0A`→32 bytes.
 2. **Pre-Allocation & Zero-RAM Fallbacks**:
-   - **CRC32**: Probed in ROM-first order (`ubinascii.crc32` → `binascii.crc32` with C-builtin check). If unavailable: pre-allocated 1024-byte table on systems with $\ge 64	ext{ KiB}$ RAM; bitwise tableless function (`@micropython.native`) consuming **0 bytes of RAM** on extreme microcontrollers.
+   - **CRC32**: Probed in ROM-first order (`ubinascii.crc32` → `binascii.crc32` with C-builtin check). If unavailable: pre-allocated 1024-byte table on systems with >= 64 KiB RAM; bitwise tableless function (`@micropython.native`) consuming **0 bytes of RAM** on extreme microcontrollers.
    - **CRC64**: Pre-allocated 2048-byte table on CPython/PyPy; tableless bitwise function on MicroPython/CircuitPython to prevent 64-bit integer heap allocation.
    - **SHA-256**: Pre-allocated `hashlib.sha256()` accumulator when `check_type == 10`.
 3. **Block Padding & Comparison**: After LZMA2 end marker, 0-3 null bytes pad (Header + Compressed Data) to a multiple of 4; non-zero → `E_FORMAT`. Check bytes read and compared (`E_CHECK` on mismatch).
@@ -169,7 +171,9 @@ All historic uncompressed data is managed by a single, unified two-tier sliding 
 
 1. **Tier 1 (Hot In-Memory Ring Buffer)**:
    - A single contiguous `bytearray` pre-allocated at initialization to the detected RAM budget:
-     $$	ext{ram\_cache\_size} = \min(	ext{dict\_size}, \max(2 	imes 	ext{block\_size}, 	ext{free\_RAM} 	imes 0.20))$$
+     ```text
+     ram_cache_size = min(dict_size, max(2 * block_size, int(free_RAM * 0.20)))
+     ```
    - Over 95% of LZMA matches fall within the most recent 16-32 KiB. Lookups within the hot buffer are resolved via direct slice operations at native memory speed with zero dictionary lookups and zero system calls.
 2. **Tier 2 (Cold Backing Store)**:
    - **Mode A (Seekable Output File)**: When the destination is a seekable file, Tier 2 *is the output file itself*. If a match distance exceeds the hot RAM ring buffer, the engine seeks and reads directly from `output_file.seek(total_written - distance)`. Zero duplicate history is written to disk.
@@ -223,8 +227,8 @@ All dictionary-based `export_state` and `import_state` mechanisms are removed. F
 ### 3.4 Non-Seekable Stream Invariants (Zero Re-Read / Zero Re-Write)
 1. **Bounded Rolling Input Spooling (`.in_spool` / `INPUT_BUFFER.bin`)**:
    - When reading from an unseekable stream (stdin/pipe), bytes are streamed through an input spool in small slices (512 B - 1 KiB), completely eliminating the need for a 64 KiB buffer in RAM on microcontrollers.
-   - At each block commit boundary (`pos == block_size` or block end), the decompressor re-bases the spool: all bytes committed prior to `engine.overall_input_offset` are pruned, and only unconsumed read-ahead bytes ($\Delta \le 64	ext{ KiB}$) are retained.
-   - The on-disk spool file size is strictly bounded to $O(1) \le 64	ext{ KiB}$ for the entire life of the stream, eliminating disk exhaustion and flash write wear on long streams.
+   - At each block commit boundary (`pos == block_size` or block end), the decompressor re-bases the spool: all bytes committed prior to `engine.overall_input_offset` are pruned, and only unconsumed read-ahead bytes (<= 64 KiB) are retained.
+   - The on-disk spool file size is strictly bounded to O(1) <= 64 KiB for the entire life of the stream, eliminating disk exhaustion and flash write wear on long streams.
    - On resumption, the decompressor drains the unconsumed read-ahead from the spool before reading fresh bytes from the pipe.
    - **Invariant**: Upstream pipe bytes are NEVER re-read, and the spool file never grows unbounded.
 2. **Unseekable Output Alignment**:
@@ -237,14 +241,14 @@ All dictionary-based `export_state` and `import_state` mechanisms are removed. F
 2. **Sliding Memory Allocation Matrix**:
    | Environment | Working RAM | `block_size` | Hot RAM Ring Buffer | History Backing | Literal Prob Table |
    |:---|:---|:---|:---|:---|:---|
-   | **MicroPython Extreme** | $< 64	ext{ KiB}$ | **4 KiB** | 0 KiB | Output file or `.hist` scratch | 1.5 KiB (paged to `.plit` if pathological) |
-   | **MicroPython Standard** | $128	ext{ KiB} - 2	ext{ MiB}$ | **8 KiB** | 16-32 KiB | Output file or `.hist` scratch | Full in RAM (up to 24.5 KiB) |
-   | **Desktop / Server** | $\ge 72	ext{ MiB}$ | **64 KiB** | Full `dict_size` | Output file or RAM | Full in RAM (up to 6.3 MiB) |
+| **MicroPython Extreme** | < 96 KiB | **512 B** | 0 KiB | Output file or `.hist` scratch | 1.5 KiB (paged to `.plit` if pathological) |
+| **MicroPython Standard** | 96 KiB - 256 KiB | **8 KiB** | 16-32 KiB | Output file or `.hist` scratch | Full in RAM (up to 24.5 KiB) |
+| **Desktop / Server** | >= 256 KiB | **64 KiB** | Full `dict_size` | Output file or RAM | Full in RAM (up to 6.3 MiB) |
 3. **Pathological Legacy LZMA Probability Table Paging**:
-   - In legacy LZMA (`.lzma`), streams with `lc=8, lp=4` declare a 6.29 MiB table ($4,096$ sub-tables of 1.5 KiB each).
+   - In legacy LZMA (`.lzma`), streams with `lc=8, lp=4` declare a 6.29 MiB table (4,096 sub-tables of 1.5 KiB each).
    - On devices where the full table exceeds 20% of free RAM, the engine keeps an active working set in a pre-allocated 1.5 KiB array (`array.array("H", [1024]*768)`) and pages inactive sub-tables to `.xz_history/<stream_id>.plit`.
 4. **Watermarked Adaptive Garbage Collection**:
-   - Checked once every 16 blocks: `gc.collect()` is invoked ONLY if capability-detected `_gc_mem_free()` exists and reports $< 4	ext{ KiB}$ available RAM.
+   - Checked once every 16 blocks: `gc.collect()` is invoked ONLY if capability-detected `_gc_mem_free()` exists and reports < 4 KiB available RAM.
    - On CPython, PyPy, and GraalPy, `_gc_mem_free` is `None` (zero GC impact).
 5. **Traceback Heap Safety Zone**:
    - Top-level execution runs inside a nested `try / finally` holding an emergency 1 KiB cushion (`memory_cushion = bytearray(1024)`).
@@ -292,7 +296,7 @@ To resume, run: xz_decompressor.py <INPUT> [-o <OUTPUT>] --resume-dir=<DIR> [--r
 
 ### 5.1 Multi-Stream Concatenation, Padding & Output Routing
 - **Stream Padding**: 0 or more null bytes whose total count is a multiple of 4 permitted between streams and at EOF. Non-multiple-of-4 or non-null bytes before next stream header → `E_FORMAT`.
-- **Output Routing**: Stream 0 writes to `<base>`; Stream $K \ge 1$ writes to `<base>_<K><ext>` (`out.bin` → `out_1.bin`). When writing to stdout all streams concatenate.
+- **Output Routing**: Stream 0 writes to `<base>`; Stream K >= 1 writes to `<base>_<K><ext>` (`out.bin` → `out_1.bin`). When writing to stdout all streams concatenate.
 - **Output Creation**: Created when Stream starts, ensuring empty streams yield empty files.
 - **Boundary Telemetry** (stderr, emitted only when another stream follows):
   `[xz:stream boundary] input_offset=...B stream_in=...B stream_out=...B output_offset=...B starting stream <K> -> <target>`
@@ -306,8 +310,8 @@ To resume, run: xz_decompressor.py <INPUT> [-o <OUTPUT>] --resume-dir=<DIR> [--r
 ### 5.5 Normative Legacy LZMA_Alone (`.lzma`) Container Specification
 1. **13-Byte Header**:
    - Byte 0: `p = (pb * 5 + lp) * 9 + lc <= 224`, `pb <= 4`, `lp <= 4`, `lc <= 8`.
-   - Bytes 1-4: Dictionary size (little-endian uint32). Valid sizes: `0`, `0xFFFFFFFF`, $2^n$, or $2^n + 2^{n-1}$.
-   - Bytes 5-12: Uncompressed size (little-endian uint64). `0xFFFFFFFFFFFFFFFF` (unknown, mandatory EOS) or $< 256	ext{ GiB}$.
+   - Bytes 1-4: Dictionary size (little-endian uint32). Valid sizes: `0`, `0xFFFFFFFF`, 2^n, or 2^n + 2^(n-1).
+   - Bytes 5-12: Uncompressed size (little-endian uint64). `0xFFFFFFFFFFFFFFFF` (unknown, mandatory EOS) or < 256 GiB.
 2. **Range Decoder First Byte**: MUST be `0x00` (`E_FORMAT`).
 3. **Format Detection & Empty Input**: Empty input (0 bytes) raises `E_FORMAT` (exit 1). Properties byte `0x00` (`lc=0, lp=0, pb=0`) is valid.
 4. **EOF & Truncation Integrity**: Unknown-size streams terminate strictly at explicit EOS marker (`dist == 0xFFFFFFFF`); premature EOF raises `E_FORMAT`. Known-size streams terminate at exact byte count; premature EOF raises `E_FORMAT`.
@@ -378,7 +382,7 @@ The self-contained test suite validates:
 3. **Zero-Allocation Direct-to-Disk Freeze/Thaw**: Verification that `freeze()` and `thaw()` stream binary state directly via `readinto()` without generating Python dictionaries.
 4. **Resumption Convergence**: Multi-pass resumption under tight timeouts converging to bit-exact match with oracle.
 5. **Stream Invariants**: Input read-ahead spooling (zero pipe re-reads) and output stream alignment (zero duplicate stdout writes).
-6. **Pathological Legacy LZMA Paging**: Successful decompression of streams declaring extreme probability tables (`lc=8, lp=4` $	o 6.29	ext{ MiB}$) under simulated low-RAM limits ($\le 128	ext{ KiB}$).
+6. **Pathological Legacy LZMA Paging**: Successful decompression of streams declaring extreme probability tables (`lc=8, lp=4` -> 6.29 MiB) under simulated low-RAM limits (<= 128 KiB).
 7. **Cross-Engine Portability**: Tests pass under CPython, PyPy, and MicroPython/CircuitPython shims with no-table CRC code paths.
 8. **Multi-Process Concurrency & Cleanup**: Concurrent streams in `.xz_history` isolate artifacts and automatically unlink the directory when the final stream completes.
 
@@ -404,10 +408,10 @@ The self-contained test suite validates:
 ### Changes from Revision 10 to Revision 11
 | # | Change | Reason (empirically verified against Rev 10 baseline) |
 |:---|:---|:---|
-| 1 | §2.1: Three-tier adaptive block sizing (512 B, 8192 B, 65536 B) based purely on RAM | Enforces 512-byte blocks when RAM $< 64	ext{ KiB}$, 8192-byte blocks when RAM $< 1	ext{ MiB}$, and 65536-byte blocks otherwise. Overrides strictly restricted to `{512, 8192, 65536}`. Enables postage-stamp microcontrollers to decompress extreme `lzma -9e` streams bit-perfectly. |
+| 1 | §2.1: Three-tier adaptive block sizing (512 B, 8192 B, 65536 B) based purely on RAM | Enforces 512-byte blocks when RAM < 96 KiB, 8192-byte blocks when RAM < 256 KiB, and 65536-byte blocks when RAM >= 256 KiB. Overrides strictly restricted to `{512, 8192, 65536}`. Enables postage-stamp microcontrollers to decompress extreme `lzma -9e` streams bit-perfectly down to ~24 KiB free heap. |
 | 2 | §2.1, §2.4: Zero closure creation and RangeDecoder reuse in decoding loop | Eradicates per-chunk `_rd_get`, `_vli`, and `RangeDecoder` allocations in `decode_block()`. Renormalization indexes chunk buffers directly via `pos < limit`. |
 | 3 | §2.5: Constant immutable `_LIT_TRANS` bytes literal | Replaces per-literal 12-element list allocations with constant `b"\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x04\x05"`, eliminating over 70 million allocations on 71.8 MB streams. |
-| 4 | §2.3: Pure-RAM CRC64 determination at startup | Eliminates engine-sniffing (`_is_embedded_python`). Evaluates available RAM once at startup: uses 256-entry table lookup whenever RAM $\ge 64	ext{ KiB}$ (eliminating 568 million bitwise shift iterations), and bitwise loop when RAM $< 64	ext{ KiB}$. |
+| 4 | §2.3: Pure-RAM CRC64 determination at startup | Eliminates engine-sniffing (`_is_embedded_python`). Evaluates available RAM once at startup: uses 256-entry table lookup whenever RAM >= 96 KiB (eliminating 568 million bitwise shift iterations), and bitwise loop when RAM < 96 KiB. |
 | 5 | §3.3, §3.4: Standalone `.inbuf` and `.hbuf` with safe generational sharing | `.inbuf` and `.hbuf` remain external standalone files. Consecutive state iterations safely share them until the subsequent iteration commits and prunes obsolete earlier versions. |
 
 ### Changes from Revision 8 to Revision 9
