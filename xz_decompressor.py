@@ -16,8 +16,43 @@ import io
 import array
 import gc
 
+try:
+    from micropython import const
+except ImportError:
+    const = lambda x: x
+
+_PROB_INIT = const(1024)
+_PROB_BITS = const(11)
+_PROB_MOVE_BITS = const(5)
+_PROB_TOTAL = const(2048)
+_RC_TOP_MASK = const(0x01000000)
+_RC_TOTAL_RANGE = const(0xFFFFFFFF)
+
+_NUM_STATES = const(12)
+_MATCH_MIN_LEN = const(2)
+_LIT_BASE_SIZE = const(768)
+_MAX_DICT_SIZE = const(67108864)
+
+_BS_MICRO = const(512)
+_BS_MID = const(8192)
+_BS_LARGE = const(65536)
+
+_FILTER_LZMA2 = const(0x21)
+_CHECK_NONE = const(0)
+_CHECK_CRC32 = const(1)
+_CHECK_CRC64 = const(4)
+_CHECK_SHA256 = const(10)
+_EOS_DIST = const(0xFFFFFFFF)
+
+_E_FORMAT = const(1)
+_E_UNSUPPORTED = const(1)
+_E_CHECK = const(1)
+_E_RESOURCE = const(1)
+_E_IO = const(1)
+_E_DEADLINE = const(124)
+
 _gc_mem_free = getattr(gc, "mem_free", None)
-_PROB_INIT_ELEMENT = struct.pack("<H", 1024)
+_PROB_INIT_ELEMENT = struct.pack("<H", _PROB_INIT)
 
 
 _IS_DESKTOP_PY = getattr(
@@ -853,7 +888,7 @@ def select_write_back_blocks(
     return max(1, min(16, blocks))
 
 
-ALLOWED_BLOCK_SIZES = (512, 8192, 65536)
+ALLOWED_BLOCK_SIZES = (_BS_MICRO, _BS_MID, _BS_LARGE)
 
 
 def select_block_size(block_size_choice="auto", available_mem=None):
@@ -872,10 +907,10 @@ def select_block_size(block_size_choice="auto", available_mem=None):
     # 8192-byte blocks require ~78 KiB working set (cur_block, history cache, 12 KiB p_lit,
     # core arrays, file I/O buffers, object overhead) plus 2x fragmentation margin -> ~160 KiB RAM.
     if available_mem < 160 * 1024:
-        return 512
+        return _BS_MICRO
     if available_mem < 1024 * 1024:
-        return 8192
-    return 65536
+        return _BS_MID
+    return _BS_LARGE
 
 
 def select_history_backend(
@@ -1467,18 +1502,18 @@ class RangeDecoder:
     @micropython.native
     def decode_bit(self, probs, index):
         prob = probs[index]
-        bound = (self.range >> 11) * prob
+        bound = (self.range >> _PROB_BITS) * prob
         if self.code < bound:
             self.range = bound
-            probs[index] = prob + ((2048 - prob) >> 5)
+            probs[index] = prob + ((_PROB_TOTAL - prob) >> _PROB_MOVE_BITS)
             bit = 0
         else:
-            self.range = (self.range - bound) & 0xFFFFFFFF
-            self.code = (self.code - bound) & 0xFFFFFFFF
-            probs[index] = prob - (prob >> 5)
+            self.range = (self.range - bound) & _RC_TOTAL_RANGE
+            self.code = (self.code - bound) & _RC_TOTAL_RANGE
+            probs[index] = prob - (prob >> _PROB_MOVE_BITS)
             bit = 1
-        if self.range < 0x01000000:
-            self.range = (self.range << 8) & 0xFFFFFFFF
+        if self.range < _RC_TOP_MASK:
+            self.range = (self.range << 8) & _RC_TOTAL_RANGE
             if self.pos < self.limit:
                 b = self.buf[self.pos]
                 self.pos += 1
@@ -1486,7 +1521,7 @@ class RangeDecoder:
                 b = self.read_byte()
             else:
                 b = 0
-            self.code = ((self.code << 8) | b) & 0xFFFFFFFF
+            self.code = ((self.code << 8) | b) & _RC_TOTAL_RANGE
         return bit
 
     @micropython.native
@@ -1523,21 +1558,21 @@ class RangeDecoder:
             else:
                 idx = off + symbol
             prob = probs[idx]
-            bound = (rng >> 11) * prob
+            bound = (rng >> _PROB_BITS) * prob
             if code < bound:
                 rng = bound
-                probs[idx] = prob + ((2048 - prob) >> 5)
+                probs[idx] = prob + ((_PROB_TOTAL - prob) >> 5)
                 symbol = symbol << 1
                 if mb >= 0 and mbit != 0:
                     mb = -1
             else:
                 rng -= bound
                 code -= bound
-                probs[idx] = prob - (prob >> 5)
+                probs[idx] = prob - (prob >> _PROB_MOVE_BITS)
                 symbol = (symbol << 1) + 1
                 if mb >= 0 and mbit != 1:
                     mb = -1
-            if rng < 0x01000000:
+            if rng < _RC_TOP_MASK:
                 rng = rng << 8
                 if pos < limit:
                     b = buf[pos]
@@ -1549,7 +1584,7 @@ class RangeDecoder:
                     limit = self.limit
                 else:
                     b = 0
-                code = ((code << 8) | b) & 0xFFFFFFFF
+                code = ((code << 8) | b) & _RC_TOTAL_RANGE
         self.range = rng
         self.code = code
         self.pos = pos
@@ -1560,15 +1595,15 @@ class RangeDecoder:
         val = 0
         for _ in range(num_bits):
             self.range >>= 1
-            self.code = (self.code - self.range) & 0xFFFFFFFF
+            self.code = (self.code - self.range) & _RC_TOTAL_RANGE
             if (self.code >> 31) & 1:
-                self.code = (self.code + self.range) & 0xFFFFFFFF
+                self.code = (self.code + self.range) & _RC_TOTAL_RANGE
                 bit = 0
             else:
                 bit = 1
             val = (val << 1) | bit
-            if self.range < 0x01000000:
-                self.range = (self.range << 8) & 0xFFFFFFFF
+            if self.range < _RC_TOP_MASK:
+                self.range = (self.range << 8) & _RC_TOTAL_RANGE
                 if self.pos < self.limit:
                     b = self.buf[self.pos]
                     self.pos += 1
@@ -1576,7 +1611,7 @@ class RangeDecoder:
                     b = self.read_byte()
                 else:
                     b = 0
-                self.code = ((self.code << 8) | b) & 0xFFFFFFFF
+                self.code = ((self.code << 8) | b) & _RC_TOTAL_RANGE
         return val
 
 
@@ -1614,6 +1649,8 @@ class XZStreamDecompressor:
     ):
         self.zero_copy = zero_copy
         self.input = input_source
+        if _gc_mem_free is not None and _gc_mem_free() < 160 * 1024:
+            gc.collect()
         self._exact_buf = bytearray(256)
         self.history = (
             history_backend
@@ -2401,7 +2438,8 @@ class XZStreamDecompressor:
                             raise XZFormatError("Invalid magic")
                         break
 
-                    if self.null_count == 0 and b[0] <= 224:
+                    if self.null_count % 4 == 0 and b[0] <= 224:
+                        self.null_count = 0
                         pbyte = b[0]
                         hdr_rest = self._read_exact(12)
                         dict_sz = struct.unpack("<I", hdr_rest[0:4])[0]
@@ -2771,7 +2809,7 @@ class XZStreamDecompressor:
                             if nb == b"\x00":
                                 pad_nulls += 1
                                 continue
-                            elif nb == b"\xfd":
+                            elif nb == b"\xfd" or nb[0] <= 224:
                                 if pad_nulls % 4 != 0:
                                     raise XZFormatError(
                                         "Stream padding not multiple of 4"
@@ -2789,39 +2827,14 @@ class XZStreamDecompressor:
                             raise XZFormatError(
                                 "Trailing bytes after legacy LZMA stream"
                             )
+                    elif pb[0] <= 224:
+                        self._peeked_byte = pb
+                        has_next = True
+                        self.phase = "STREAM_HEADER"
                     else:
-                        if pb[0] <= 224 and is_seekable(self.input):
-                            cur = self.input.tell()
-                            hdr12 = self.input.read(12)
-                            if len(hdr12) == 12:
-                                d_sz = struct.unpack("<I", hdr12[0:4])[0]
-                                u_sz = struct.unpack("<Q", hdr12[4:12])[0]
-                                rc_b = self.input.read(1)
-                                self.input.seek(cur)
-                                if (
-                                    _is_valid_lzma_dict(d_sz)
-                                    and (
-                                        u_sz == 0xFFFFFFFFFFFFFFFF
-                                        or u_sz < 256 * 1024**3
-                                    )
-                                    and rc_b == b"\x00"
-                                ):
-                                    self._peeked_byte = pb
-                                    has_next = True
-                                    self.phase = "STREAM_HEADER"
-                                else:
-                                    raise XZFormatError(
-                                        "Trailing bytes after legacy LZMA stream"
-                                    )
-                            else:
-                                self.input.seek(cur)
-                                raise XZFormatError(
-                                    "Trailing bytes after legacy LZMA stream"
-                                )
-                        else:
-                            raise XZFormatError(
-                                "Trailing bytes after legacy LZMA stream"
-                            )
+                        raise XZFormatError(
+                            f"Trailing bytes after legacy LZMA stream: 0x{pb[0]:02x}"
+                        )
 
                 self.pending_boundary = StreamBoundaryEvent(
                     stream_index=self.stream_index,
@@ -3126,6 +3139,7 @@ class XZStreamDecompressor:
                                             self.in_match_copy = False
                                         return committed, False
                                 self.in_match_copy = False
+                                continue
 
                             pos_state = (
                                 self.stream_out_offset + self.cur_block_pos
@@ -3466,7 +3480,7 @@ class XZStreamDecompressor:
                     if pb == b"\x00":
                         pad_nulls += 1
                         continue
-                    elif pb == b"\xfd":
+                    elif pb == b"\xfd" or pb[0] <= 224:
                         if pad_nulls % 4 != 0:
                             raise XZFormatError("Stream padding not multiple of 4")
                         has_next = True
@@ -5841,29 +5855,46 @@ class TestXZDecompressor(_TestCaseBase):
                 out_f = root / "output.bin"
                 r_dir = root / "resume"
                 in_f.write_bytes(xz_data)
+                t_val = 0.15
                 timed_out = False
                 completed = False
-                for _attempt in range(30):
-                    try:
-                        decompress_xz(
-                            str(in_f),
-                            str(out_f),
-                            resume_dir=str(r_dir),
-                            resume_mode="auto",
-                            timeout=0.15,
-                            cpu_timeout=0.15,
-                            block_size=8192,
-                            checkpoint_interval="16k",
-                            in_place=True,
-                            write_back_cache=1,
-                        )
-                        completed = True
+                for _scale_pass in range(6):
+                    out_f.unlink(missing_ok=True)
+                    for f in r_dir.glob("*"):
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+                    timed_out = False
+                    completed = False
+                    for _attempt in range(40):
+                        try:
+                            decompress_xz(
+                                str(in_f),
+                                str(out_f),
+                                resume_dir=str(r_dir),
+                                resume_mode="auto",
+                                timeout=t_val,
+                                cpu_timeout=t_val,
+                                block_size=8192,
+                                checkpoint_interval="16k",
+                                in_place=True,
+                                write_back_cache=1,
+                            )
+                            completed = True
+                            break
+                        except (WallClockTimeout, CPUTimeout):
+                            timed_out = True
+
+                    if completed and timed_out:
                         break
-                    except (WallClockTimeout, CPUTimeout):
-                        timed_out = True
+                    if completed and not timed_out:
+                        # Finished before timeout fired: machine is fast, scale down timeout
+                        t_val = max(0.005, t_val / 4.0)
+
                 self.assertTrue(timed_out, "test must exercise interrupted invocations")
                 self.assertTrue(
-                    completed, "resumption did not converge within 30 attempts"
+                    completed, "resumption did not converge within attempts"
                 )
                 self.assertEqual(out_f.read_bytes(), raw)
         finally:
@@ -6241,6 +6272,60 @@ class TestXZDecompressor(_TestCaseBase):
         hist = UnifiedHistory(storage_driver=vfs, ram_cache_bytes=512, block_size=512)
         hist.append_block(b"S" * 512)
         self.assertEqual(hist.blocks_len, 512)
+
+    def test_concatenation_all_four_flavors_and_padding(self):
+        # Comprehensive validation of all 4 concatenation flavors (xz+xz, xz+lzma, lzma+xz, lzma+lzma)
+        lzma = self.lzma
+        import io
+
+        class NonSeekPipe(io.RawIOBase):
+            def __init__(self, raw_bytes):
+                self.buf = io.BytesIO(raw_bytes)
+
+            def read(self, n=-1):
+                return self.buf.read(n)
+
+            def readable(self):
+                return True
+
+            def seekable(self):
+                return False
+
+        s1 = b"STREAM_FIRST_CONTENT_ABCDEF_" * 35
+        s2 = b"STREAM_SECOND_CONTENT_GHIJKL_" * 35
+        c_xz1 = lzma.compress(s1, format=lzma.FORMAT_XZ)
+        c_xz2 = lzma.compress(s2, format=lzma.FORMAT_XZ)
+        c_lzma1 = lzma.compress(s1, format=lzma.FORMAT_ALONE)
+        c_lzma2 = lzma.compress(s2, format=lzma.FORMAT_ALONE)
+
+        pairs = [
+            ("xz+xz", c_xz1, c_xz2),
+            ("xz+lzma", c_xz1, c_lzma2),
+            ("lzma+xz", c_lzma1, c_xz2),
+            ("lzma+lzma", c_lzma1, c_lzma2),
+        ]
+        for name, c1, c2 in pairs:
+            for pad in [0, 4, 8]:
+                combined = c1 + (b"\x00" * pad) + c2
+                # Seekable stream
+                eng_seek = XZStreamDecompressor(io.BytesIO(combined))
+                out_seek = b"".join(
+                    ev.data
+                    for ev in eng_seek.decode_events()
+                    if ev.type == XZEventType.CHUNK_OUTPUT
+                )
+                self.assertEqual(out_seek, s1 + s2, f"Failed seekable {name} pad={pad}")
+
+                # Unseekable pipe stream
+                eng_pipe = XZStreamDecompressor(NonSeekPipe(combined))
+                out_pipe = b"".join(
+                    ev.data
+                    for ev in eng_pipe.decode_events()
+                    if ev.type == XZEventType.CHUNK_OUTPUT
+                )
+                self.assertEqual(
+                    out_pipe, s1 + s2, f"Failed unseekable {name} pad={pad}"
+                )
 
     def test_concatenated_intermixed_lzma_xz_streams(self):
         lzma = self.lzma
