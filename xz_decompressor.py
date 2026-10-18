@@ -1270,6 +1270,9 @@ class UnifiedHistory(HistoryBackend):
         self.blocks = []
         self.blocks_len = 0
         self.in_ram_only = self.output_file is None and self.storage is None
+        self._recycled_block = (
+            bytearray(self.block_size) if self.max_blocks == 1 else None
+        )
 
     def set_output_file(self, output_file):
         """Bind seekable output file as history tier 2 and close/remove any scratch file."""
@@ -1303,23 +1306,31 @@ class UnifiedHistory(HistoryBackend):
         if b_len == 0:
             return
 
-        max_b = (
-            (self.max_history // self.block_size)
-            if self.in_ram_only
-            else self.max_blocks
-        )
-        limit = self.max_history if self.in_ram_only else self.ram_cache_bytes
-        # Free oldest block FIRST before allocating the new block to return contiguous memory to heap
-        while self.blocks and (
-            len(self.blocks) >= max_b or (self.blocks_len + b_len) > limit
+        if (
+            not self.in_ram_only
+            and self._recycled_block is not None
+            and b_len <= len(self._recycled_block)
         ):
-            dropped = self.blocks.pop(0)
-            self.blocks_len -= len(dropped)
+            self._recycled_block[:b_len] = block_data
+            if not self.blocks:
+                self.blocks.append(self._recycled_block)
+            self.blocks_len = b_len
+        else:
+            max_b = (
+                (self.max_history // self.block_size)
+                if self.in_ram_only
+                else self.max_blocks
+            )
+            limit = self.max_history if self.in_ram_only else self.ram_cache_bytes
+            while self.blocks and (
+                len(self.blocks) >= max_b or (self.blocks_len + b_len) > limit
+            ):
+                self.blocks_len -= len(self.blocks.pop(0))
 
-        _maybe_collect(2 * b_len)
-        b = bytes(block_data)
-        self.blocks.append(b)
-        self.blocks_len += b_len
+            _maybe_collect(4096)
+            b = bytes(block_data)
+            self.blocks.append(b)
+            self.blocks_len += b_len
 
         # Mode B: Write to scratch file ONLY when output_file is None/unseekable!
         if self.output_file is None and self.storage is not None:
