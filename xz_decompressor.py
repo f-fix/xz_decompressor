@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-xz_decompressor - Pure-Python XZ / LZMA2 Streaming Decompression Engine (Revision 9).
+xz_decompressor - Pure-Python XZ / LZMA2 Streaming Decompression Engine (Revision 12).
 
 Zero required external dependencies, apart from --test mode.
 
@@ -67,7 +67,10 @@ _IS_DESKTOP_PY = getattr(
 
 def _make_prob_array(count):
     if _IS_DESKTOP_PY:
-        return array.array("H", [1024]) * count
+        try:
+            return array.array("H", [1024]) * count
+        except TypeError:
+            pass
     return array.array("H", (1024 for _ in range(count)))
 
 
@@ -85,10 +88,13 @@ def _reset_lit_tables(tables):
 
 def _reset_prob_array(arr):
     if _IS_DESKTOP_PY and isinstance(arr, array.array):
-        arr[:] = array.array("H", [1024]) * len(arr)
-    else:
-        for i in range(len(arr)):
-            arr[i] = 1024
+        try:
+            arr[:] = array.array("H", [1024]) * len(arr)
+            return
+        except TypeError:
+            pass
+    for i in range(len(arr)):
+        arr[i] = 1024
 
 
 _LIT_TRANS = b"\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x04\x05"
@@ -320,7 +326,34 @@ class _PathFallback:
             return f.write(s)
 
     def stat(self):
-        return os.stat(self._p)
+        s = os.stat(self._p)
+        if hasattr(s, "st_size"):
+            return s
+
+        class _StatResult:
+            def __init__(self, tup):
+                self._tup = tup
+                self.st_mode = tup[0]
+                self.st_ino = tup[1]
+                self.st_dev = tup[2]
+                self.st_nlink = tup[3]
+                self.st_uid = tup[4]
+                self.st_gid = tup[5]
+                self.st_size = tup[6]
+                self.st_atime = tup[7]
+                self.st_mtime = tup[8]
+                self.st_ctime = tup[9]
+
+            def __getitem__(self, idx):
+                return self._tup[idx]
+
+            def __len__(self):
+                return len(self._tup)
+
+            def __iter__(self):
+                return iter(self._tup)
+
+        return _StatResult(s)
 
     def glob(self, pat):
         res = []
@@ -1264,6 +1297,7 @@ class UnifiedHistory(HistoryBackend):
             return self.scratch_file
         return None
 
+    @micropython.native
     def append_block(self, block_data, block_index=0, input_hash=""):
         b_len = len(block_data)
         if b_len == 0:
@@ -1282,6 +1316,7 @@ class UnifiedHistory(HistoryBackend):
             dropped = self.blocks.pop(0)
             self.blocks_len -= len(dropped)
 
+        _maybe_collect(2 * b_len)
         b = bytes(block_data)
         self.blocks.append(b)
         self.blocks_len += b_len
@@ -1299,6 +1334,7 @@ class UnifiedHistory(HistoryBackend):
     def history_len(self):
         return min(self.total_written, self.max_history)
 
+    @micropython.native
     def get_history_slice(self, distance, length):
         h_len = self.history_len()
         if distance <= 0 or distance > h_len or length <= 0 or length > distance:
@@ -1369,6 +1405,7 @@ class UnifiedHistory(HistoryBackend):
 
         raise XZFormatError(f"Distance {distance} exceeds available history")
 
+    @micropython.native
     def tail_crc32(self, n=65536):
         avail_max = (
             self.blocks_len
@@ -1664,11 +1701,19 @@ class XZStreamDecompressor:
         force_gc=True,
         zero_copy=False,
         wb_blocks=1,
+        stdin=sys.stdin,
+        stdout=sys.stdout,
+        stderr=sys.stderr,
     ):
         self.zero_copy = zero_copy
-        self.input = input_source
-        if _gc_mem_free is not None and _gc_mem_free() < 160 * 1024:
-            gc.collect()
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        if input_source == "-" or input_source is None:
+            self.input = getattr(self.stdin, "buffer", self.stdin)
+        else:
+            self.input = input_source
+        _maybe_collect(160 * 1024)
         self.block_size = block_size
         self.lc = 3
         self.lp = 0
@@ -1800,6 +1845,7 @@ class XZStreamDecompressor:
         self.overall_input_offset += n
         return res_b
 
+    @micropython.native
     def _read_vli_from_buf(self, buf, off):
         val = 0
         s = 0
@@ -1833,6 +1879,7 @@ class XZStreamDecompressor:
         self.overall_input_offset += 1
         return ib[0]
 
+    @micropython.native
     def _refill_chunk_byte(self):
         if self.chunk_stream_off < len(self.chunk_stream_buf):
             b = self.chunk_stream_buf[self.chunk_stream_off]
@@ -2190,9 +2237,10 @@ class XZStreamDecompressor:
                                 )
                             for arr in engine._core_prob_arrays():
                                 n = f_core.readinto(arr)
-                                assert (
-                                    n == len(arr) * 2
-                                ), "readinto failed for core array"
+                                if n != len(arr) * 2:
+                                    raise XZResourceError(
+                                        "readinto failed for core array"
+                                    )
                             f_core.close()
 
                         plit_name = (
@@ -2229,10 +2277,14 @@ class XZStreamDecompressor:
                             if isinstance(engine.p_lit, list):
                                 for sub in engine.p_lit:
                                     n = f_lit.readinto(sub)
-                                    assert n == len(sub) * 2
+                                    if n != len(sub) * 2:
+                                        raise XZResourceError(
+                                            "readinto failed for plit"
+                                        )
                             else:
                                 n = f_lit.readinto(engine.p_lit)
-                                assert n == len(engine.p_lit) * 2
+                                if n != len(engine.p_lit) * 2:
+                                    raise XZResourceError("readinto failed for plit")
                             f_lit.close()
 
                         inbuf_name = (
@@ -2292,7 +2344,8 @@ class XZStreamDecompressor:
                             n = f_cblk.readinto(
                                 memoryview(engine.cur_block)[:exp_cblk_len]
                             )
-                            assert n == exp_cblk_len, "readinto failed for cblk"
+                            if n != exp_cblk_len:
+                                raise XZResourceError("readinto failed for cblk")
                             f_cblk.close()
 
                         hbuf_name = (
@@ -2364,8 +2417,7 @@ class XZStreamDecompressor:
         # avoids turning 512-byte blocks into a GC call every 512 output bytes.
         if self.force_gc and (self.block_idx & 15) == 0:
             try:
-                if _gc_mem_free is not None and _gc_mem_free() < 4096:
-                    gc.collect()
+                _maybe_collect()
             except Exception:
                 pass
         return committed
@@ -4029,14 +4081,26 @@ def decompress_xz(
     ignore_space_check=False,
     storage_driver=None,
     write_back_cache=None,
+    stdin=sys.stdin,
+    stdout=sys.stdout,
+    stderr=sys.stderr,
 ):
     """
     Callable interface for XZ decompression with persistent checkpoint resumption.
     """
+
+    def _write_err(msg):
+        stderr.write(msg)
+        if hasattr(stderr, "flush"):
+            try:
+                stderr.flush()
+            except Exception:
+                pass
+
     caller_owned_output = hasattr(output_target, "write")
     if isinstance(input_source, (str, Path)):
         if str(input_source) == "-":
-            in_stream = sys.stdin.buffer
+            in_stream = getattr(stdin, "buffer", stdin)
             if output_target is None:
                 output_target = "stdin.unxz"
         else:
@@ -4069,12 +4133,10 @@ def decompress_xz(
         ignore_space_check=ignore_space_check,
     )
     if not ok_space:
-        sys.stderr.write(f"xz_decompressor: E_RESOURCE: {space_msg}\n")
-        sys.stderr.flush()
+        _write_err(f"xz_decompressor: E_RESOURCE: {space_msg}\n")
         raise XZResourceError(space_msg)
     elif space_msg and msg_type == "warning":
-        sys.stderr.write(f"xz_decompressor: warning: {space_msg}\n")
-        sys.stderr.flush()
+        _write_err(f"xz_decompressor: warning: {space_msg}\n")
 
     def _compute_input_id(stream):
         if is_seekable(stream):
@@ -4123,6 +4185,8 @@ def decompress_xz(
     elif avail_mem < 80 * 1024 * 1024:
         max_blocks = max(1, int((avail_mem * 0.20) // actual_block_size))
         c_budget = min(16 * 1024 * 1024, max_blocks * actual_block_size)
+    elif not _IS_DESKTOP_PY:
+        c_budget = min(16 * actual_block_size, 1024 * 1024)
     else:
         c_budget = 64 * 1024 * 1024 + actual_block_size
 
@@ -4148,8 +4212,7 @@ def decompress_xz(
         timeout_sec=timeout_sec,
         storage_driver=storage,
     )
-    if _gc_mem_free is not None and _gc_mem_free() < 160 * 1024:
-        gc.collect()
+    _maybe_collect(160 * 1024)
     engine = XZStreamDecompressor(
         in_stream,
         history,
@@ -4157,6 +4220,9 @@ def decompress_xz(
         force_gc=force_gc,
         zero_copy=True,
         wb_blocks=wb_blocks,
+        stdin=stdin,
+        stdout=stdout,
+        stderr=stderr,
     )
     if resume_dir and resume_mode != "off":
         engine._enable_state_export = True
@@ -4184,44 +4250,46 @@ def decompress_xz(
         else:
             timeout_sec = deadline_remaining
 
-    # Set up signal handlers if available
     sig_alarm_old = None
     sig_vtalrm_old = None
-    if (
-        signal is not None
-        and hasattr(signal, "SIGALRM")
-        and timeout_sec
-        and timeout_sec > 0
-    ):
 
-        def _on_sigalrm(signum, frame):
-            raise WallClockTimeout("Wall-clock timeout reached (SIGALRM)")
+    def _arm_timers():
+        nonlocal sig_alarm_old, sig_vtalrm_old
+        if (
+            signal is not None
+            and hasattr(signal, "SIGALRM")
+            and timeout_sec
+            and timeout_sec > 0
+        ):
 
-        try:
-            sig_alarm_old = signal.signal(signal.SIGALRM, _on_sigalrm)
-            if hasattr(signal, "setitimer"):
-                signal.setitimer(signal.ITIMER_REAL, timeout_sec)
-            elif math is not None and hasattr(signal, "alarm"):
-                signal.alarm(int(math.ceil(timeout_sec)))
-        except (ValueError, OSError, AttributeError):
-            pass
+            def _on_sigalrm(signum, frame):
+                raise WallClockTimeout("Wall-clock timeout reached (SIGALRM)")
 
-    if (
-        signal is not None
-        and hasattr(signal, "ITIMER_VIRTUAL")
-        and hasattr(signal, "SIGVTALRM")
-        and cpu_timeout_sec
-        and cpu_timeout_sec > 0
-    ):
+            try:
+                sig_alarm_old = signal.signal(signal.SIGALRM, _on_sigalrm)
+                if hasattr(signal, "setitimer"):
+                    signal.setitimer(signal.ITIMER_REAL, timeout_sec)
+                elif math is not None and hasattr(signal, "alarm"):
+                    signal.alarm(int(math.ceil(timeout_sec)))
+            except (ValueError, OSError, AttributeError):
+                pass
 
-        def _on_sigvtalrm(signum, frame):
-            raise CPUTimeout("CPU timeout reached (SIGVTALRM)")
+        if (
+            signal is not None
+            and hasattr(signal, "ITIMER_VIRTUAL")
+            and hasattr(signal, "SIGVTALRM")
+            and cpu_timeout_sec
+            and cpu_timeout_sec > 0
+        ):
 
-        try:
-            sig_vtalrm_old = signal.signal(signal.SIGVTALRM, _on_sigvtalrm)
-            signal.setitimer(signal.ITIMER_VIRTUAL, cpu_timeout_sec)
-        except (ValueError, OSError, AttributeError):
-            pass
+            def _on_sigvtalrm(signum, frame):
+                raise CPUTimeout("CPU timeout reached (SIGVTALRM)")
+
+            try:
+                sig_vtalrm_old = signal.signal(signal.SIGVTALRM, _on_sigvtalrm)
+                signal.setitimer(signal.ITIMER_VIRTUAL, cpu_timeout_sec)
+            except (ValueError, OSError, AttributeError):
+                pass
 
     # Checkpoint helpers (§3.3)
 
@@ -4392,7 +4460,7 @@ def decompress_xz(
     if hasattr(output_target, "write"):
         curr_out_stream = output_target
     elif is_stream_output:
-        curr_out_stream = sys.stdout.buffer
+        curr_out_stream = getattr(stdout, "buffer", stdout)
     else:
         base_dest = format_suffixed_filename(output_target, 0)
         curr_dest_path = Path(base_dest)
@@ -4400,11 +4468,10 @@ def decompress_xz(
         curr_part_path = target_file if not in_place else None
 
         if is_implicit_stdin_unxz:
-            sys.stderr.write(
+            _write_err(
                 f"[xz:stream boundary] input_offset=0B stream_in=0B stream_out=0B "
                 f"output_offset=0B starting stream 0 -> {base_dest}\n"
             )
-            sys.stderr.flush()
 
     verify_output_mode = False
     verify_file_handle = None
@@ -4502,9 +4569,10 @@ def decompress_xz(
                         )
                     for arr in engine._core_prob_arrays():
                         n = f_core.readinto(arr)
-                        assert (
-                            n == len(arr) * 2
-                        ), "readinto failed for pcore on checkpoint restore"
+                        if n != len(arr) * 2:
+                            raise XZResourceError(
+                                "readinto failed for pcore on checkpoint restore"
+                            )
                     f_core.close()
 
                 if storage.exists(f"{prefix}.plit"):
@@ -4528,14 +4596,16 @@ def decompress_xz(
                     if isinstance(engine.p_lit, list):
                         for sub in engine.p_lit:
                             n = f_lit.readinto(sub)
-                            assert (
-                                n == len(sub) * 2
-                            ), "readinto failed for plit on checkpoint restore"
+                            if n != len(sub) * 2:
+                                raise XZResourceError(
+                                    "readinto failed for plit on checkpoint restore"
+                                )
                     else:
                         n = f_lit.readinto(engine.p_lit)
-                        assert (
-                            n == len(engine.p_lit) * 2
-                        ), "readinto failed for plit on checkpoint restore"
+                        if n != len(engine.p_lit) * 2:
+                            raise XZResourceError(
+                                "readinto failed for plit on checkpoint restore"
+                            )
                     f_lit.close()
 
                 if storage.exists(f"{prefix}.cblk") and engine.cur_block_pos > 0:
@@ -4550,9 +4620,10 @@ def decompress_xz(
                             f"Corrupted cblk: file size {c_sz} < recorded length {exp_cblk_len}"
                         )
                     n = f_cblk.readinto(memoryview(engine.cur_block)[:exp_cblk_len])
-                    assert (
-                        n == exp_cblk_len
-                    ), "readinto failed for cblk on checkpoint restore"
+                    if n != exp_cblk_len:
+                        raise XZResourceError(
+                            "readinto failed for cblk on checkpoint restore"
+                        )
                     f_cblk.close()
 
                 if storage.exists(f"{prefix}.hbuf") and hasattr(history, "history"):
@@ -4568,12 +4639,15 @@ def decompress_xz(
                         )
                     engine.history.history = bytearray(exp_hbuf_len)
                     n = f_hbuf.readinto(engine.history.history)
-                    assert (
-                        n == exp_hbuf_len
-                    ), "readinto failed for hbuf on checkpoint restore"
+                    if n != exp_hbuf_len:
+                        raise XZResourceError(
+                            "readinto failed for hbuf on checkpoint restore"
+                        )
                     f_hbuf.close()
 
                 checkpoint_resumed = True
+            except (KeyboardInterrupt, WallClockTimeout, CPUTimeout):
+                raise
             except Exception as ckpt_err:
                 # Corrupted checkpoint! Asymmetric recovery:
                 if is_stream_input:
@@ -4601,7 +4675,8 @@ def decompress_xz(
                         sys.stderr.write(
                             f"xz_decompressor: warning: corrupted checkpoint detected; replaying from genesis and discarding decoded output prior to offset {resume_at}.\n"
                         )
-                        sys.stderr.flush()
+                        if hasattr(stderr, "flush"):
+                            stderr.flush()
                         discard_until_offset = int(resume_at)
                         in_stream.seek(0)
                         engine = XZStreamDecompressor(
@@ -4619,7 +4694,8 @@ def decompress_xz(
                     sys.stderr.write(
                         f"xz_decompressor: warning: corrupted checkpoint detected in '{resume_dir}'; invalidating state and restarting decompression from genesis.\n"
                     )
-                    sys.stderr.flush()
+                    if hasattr(stderr, "flush"):
+                        stderr.flush()
                     in_stream.seek(0)
                     if active_out:
                         truncate_file_portable(str(active_out), 0)
@@ -4648,7 +4724,8 @@ def decompress_xz(
                 sys.stderr.write(
                     f"xz_decompressor: warning: no valid checkpoint found; replaying from genesis and discarding decoded output prior to offset {resume_at}.\n"
                 )
-                sys.stderr.flush()
+                if hasattr(stderr, "flush"):
+                    stderr.flush()
             if replay_input is not None:
                 replay_input.set_replay_offset(0)
             if not is_stream_output and curr_part_path and curr_part_path.exists():
@@ -4660,7 +4737,8 @@ def decompress_xz(
                     sys.stderr.write(
                         "xz_decompressor: warning: Verify-Output mode cannot converge when stream decode time exceeds timeout; use checkpoint mode with a persistent backend.\n"
                     )
-                    sys.stderr.flush()
+                    if hasattr(stderr, "flush"):
+                        stderr.flush()
 
     if not is_stream_output and curr_out_stream is None and not verify_output_mode:
         if (
@@ -4678,6 +4756,7 @@ def decompress_xz(
     have_checkpoint = False
 
     try:
+        _arm_timers()
         for event in engine.decode_events():
             if event.type == XZEventType.CHUNK_OUTPUT:
                 bytes_since_ckpt += len(event.data)
@@ -4787,18 +4866,16 @@ def decompress_xz(
                             )
                             engine.history.reset()
 
-                    sys.stderr.write(
+                    _write_err(
                         f"[xz:stream boundary] input_offset={event.overall_input_offset}B "
                         f"stream_in={event.input_stream_len}B stream_out={event.output_stream_len}B "
                         f"output_offset={event.overall_output_offset}B starting stream {next_stream} -> {dest_desc}\n"
                     )
-                    sys.stderr.flush()
                 else:
-                    sys.stderr.write(
+                    _write_err(
                         f"[xz:stream end] input_offset={event.overall_input_offset}B "
                         f"output_offset={event.overall_output_offset}B streams={stream_idx + 1}\n"
                     )
-                    sys.stderr.flush()
 
             if event.type != XZEventType.CHUNK_OUTPUT:
                 coop_margin = (
@@ -4885,8 +4962,7 @@ def decompress_xz(
             and not is_seekable(curr_out_stream)
         ):
             msg += f" --resume-at={engine.overall_output_offset}"
-        sys.stderr.write(msg + "\n")
-        sys.stderr.flush()
+        _write_err(msg + "\n")
         raise
     except Exception:
         try:
@@ -4916,1079 +4992,1497 @@ def decompress_xz(
     return engine.overall_output_offset
 
 
-try:
-    import unittest
-except ImportError:
-    unittest = None
+if __debug__:
+    try:
+        import unittest
+    except ImportError:
+        unittest = None
 
-if unittest is not None:
-    _TestCaseBase = unittest.TestCase
-else:
+    if unittest is not None:
+        _TestCaseBase = unittest.TestCase
+    else:
 
-    class _TestCaseBase:
-        pass
+        class _TestCaseBase:
+            pass
 
+    class _TempDirFallback:
+        def __init__(self, prefix="tmp_", dir=None):
+            base = dir or ("/tmp" if Path("/tmp").exists() else ".")
+            self.name = f"{str(base).rstrip('/')}/{prefix}{_generate_stream_id()}"
+            ensure_dir(self.name)
 
-class TestXZDecompressor(_TestCaseBase):
-    @classmethod
-    def setUpClass(cls):
-        import lzma
+        def __enter__(self):
+            return self.name
 
-        cls.lzma = lzma
+        def __exit__(self, *args):
+            p = Path(self.name)
+            for f in p.glob("*"):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            try:
+                p.rmdir()
+            except OSError:
+                pass
 
-    def setUp(self):
-        self._orig_stderr = sys.stderr
-        self._orig_stdout = sys.stdout
-        sys.stderr = io.StringIO()
-        self._fake_stdout = io.StringIO()
-        sys.stdout = self._fake_stdout
-        self._orig_stdout_buffer = getattr(self._orig_stdout, "buffer", None)
-        if self._orig_stdout_buffer is not None:
-            self._fake_stdout.buffer = io.BytesIO()
+    class _TempfileShim:
+        TemporaryDirectory = _TempDirFallback
 
-    def tearDown(self):
-        sys.stderr = self._orig_stderr
-        sys.stdout = self._orig_stdout
+    class _MissingLZMA:
+        def __getattr__(self, name):
+            if unittest is not None and hasattr(unittest, "SkipTest"):
+                raise unittest.SkipTest("lzma oracle not available")
+            raise AttributeError(name)
 
-    def test_unified_history_engine_protocol(self):
-        storage = MemoryStorage()
-        hist = UnifiedHistory(
-            output_file=None,
-            storage_driver=storage,
-            stream_id="test_stream",
-            ram_cache_bytes=1024,
-        )
-        b1 = b"ABCDEFGHIJ" * 50
-        b2 = b"KLMNOPQRST" * 50
-        b3 = b"UVWXYZ0123" * 50
-        hist.append_block(b1)
-        hist.append_block(b2)
-        hist.append_block(b3)
-        self.assertEqual(hist.history_len(), 1500)
-        sl1 = hist.get_history_slice(200, 10)
-        self.assertEqual(sl1, (b2 + b3)[-200:-190])
-        sl2 = hist.get_history_slice(1400, 10)
-        self.assertEqual(sl2, (b1 + b2 + b3)[-1400:-1390])
-        self.assertGreater(hist.tail_crc32(), 0)
-        hist.truncate_to(800)
-        self.assertEqual(hist.history_len(), 800)
-        hist.cleanup()
+        def __call__(self, *args, **kwargs):
+            if unittest is not None and hasattr(unittest, "SkipTest"):
+                raise unittest.SkipTest("lzma oracle not available")
+            raise RuntimeError("lzma oracle not available")
 
-    def test_unified_history_seekable_file_mode(self):
-        f = io.BytesIO()
-        hist = UnifiedHistory(output_file=f, ram_cache_bytes=512)
-        data = b"SEEKABLE_OUTPUT_FILE_HISTORY_DATA_" * 30
-        f.write(data)
-        hist.append_block(data)
-        self.assertEqual(hist.history_len(), len(data))
-        sl = hist.get_history_slice(len(data), 10)
-        self.assertEqual(sl, data[:10])
+    class TestXZDecompressor(_TestCaseBase):
+        stdin = sys.stdin
+        stdout = sys.stdout
+        stderr = sys.stderr
+        argv = sys.argv
 
-    def test_transient_storage_disk_and_memory(self):
-        vfs = MemoryStorage()
-        f = vfs.open("test.bin", "w+b")
-        f.write(b"HELLO_VFS")
-        f.flush()
-        self.assertTrue(vfs.exists("test.bin"))
-        f2 = vfs.open("test.bin", "rb")
-        self.assertEqual(f2.read(), b"HELLO_VFS")
-        vfs.replace("test.bin", "renamed.bin")
-        self.assertFalse(vfs.exists("test.bin"))
-        self.assertTrue(vfs.exists("renamed.bin"))
-        vfs.remove("renamed.bin")
-        self.assertFalse(vfs.exists("renamed.bin"))
+        def decompress_xz(self, *args, **kwargs):
+            kwargs.setdefault("stderr", getattr(self, "test_stderr", io.StringIO()))
+            kwargs.setdefault("stdout", getattr(self, "test_stdout", io.StringIO()))
+            return decompress_xz(*args, **kwargs)
 
-    def test_resume_descriptor_ergonomics(self):
-        desc = ResumeDescriptor(
-            resume_dir="/tmp/custom_history",
-            resume_id="stream_42",
-            resume_from=1024,
-            resume_at=4096,
-        )
-        args_str = desc.to_cli_args()
-        self.assertIn("--resume-dir=/tmp/custom_history", args_str)
-        self.assertIn("--resume-id=stream_42", args_str)
-        self.assertIn("--resume-from=1024", args_str)
-        self.assertIn("--resume-at=4096", args_str)
-        desc_seekable = ResumeDescriptor(
-            resume_dir="/tmp/custom_history",
-            resume_id=None,
-            resume_from=None,
-            resume_at=None,
-        )
-        args_seekable = desc_seekable.to_cli_args()
-        self.assertEqual(args_seekable, "--resume-dir=/tmp/custom_history")
-
-    def test_freeze_thaw_block_size_agnostic(self):
-        # Proves that an engine frozen with a large block size (64 KiB) can thaw and
-        # resume cleanly with a tiny microcontroller block size (4 KiB)
-        lzma = self.lzma
-        import io, os
-
-        raw = os.urandom(200000)
-        xz_data = lzma.compress(raw, preset=1)
-
-        # 1. Start engine with large 64 KiB block size
-        eng_large = XZStreamDecompressor(io.BytesIO(xz_data), block_size=65536)
-        blk1, eof = eng_large.decode_block()
-        self.assertEqual(len(blk1), 65536)
-        self.assertFalse(eof)
-
-        # 2. Freeze state
-        desc = eng_large.freeze(
-            resume_dir="/tmp/test_bs_agnostic_dir", stream_id="stream_bs_test"
+        # ---- Baked-in test vectors for MicroPython test execution without an lzma oracle ----
+        _BAKED_VECTORS = (
+            (
+                "xz_text_crc32",
+                "/Td6WFoAAAFpIt42AgAhARYAAAB0L+Wj4ACfAIhdACoaCKIDJWbxS3jFogX/LubZ0iAarTT44h3oQTb63AZpuzzkEDQnCeuzZuPtMzAE2XO/jUApDYsEcCjjglOWHEK7Khl6E9PaGnBuCGTFso6oyvwBbr0Pw5bkSCEbBh0IO6wHm7+HaWJ6W1Zj9o5SukPcMO5OvITBY/7mcCEDsiGPLpN/76S802oAhB8ACwABoAGgAQAAsZ+Aqz4wDYsCAAAAAAFZWg==",
+                "text",
+            ),
+            (
+                "xz_text_crc64",
+                "/Td6WFoAAATm1rRGAgAhARYAAAB0L+Wj4ACfAIhdACoaCKIDJWbxS3jFogX/LubZ0iAarTT44h3oQTb63AZpuzzkEDQnCeuzZuPtMzAE2XO/jUApDYsEcCjjglOWHEK7Khl6E9PaGnBuCGTFso6oyvwBbr0Pw5bkSCEbBh0IO6wHm7+HaWJ6W1Zj9o5SukPcMO5OvITBY/7mcCEDsiGPLpN/76S802oAWdNJjTNP87cAAaQBoAEAAKfdETCxxGf7AgAAAAAEWVo=",
+                "text",
+            ),
+            (
+                "xz_text_sha256",
+                "/Td6WFoAAArh+wyhAgAhARYAAAB0L+Wj4ACfAIhdACoaCKIDJWbxS3jFogX/LubZ0iAarTT44h3oQTb63AZpuzzkEDQnCeuzZuPtMzAE2XO/jUApDYsEcCjjglOWHEK7Khl6E9PaGnBuCGTFso6oyvwBbr0Pw5bkSCEbBh0IO6wHm7+HaWJ6W1Zj9o5SukPcMO5OvITBY/7mcCEDsiGPLpN/76S802oAJjuFWW5t8/ptfRM84lT9/6DA0W+94yjKqJyLsQW761UAAbwBoAEAAFFdlN+26d8cAgAAAAAKWVo=",
+                "text",
+            ),
+            (
+                "xz_rep",
+                "/Td6WFoAAAFpIt42AgAhARYAAAB0L+Wj4ADqABldADCYiKWDbgNPmS3msVFcUBG2vRfYbZMCV8AAAAAAmAO/XQABMesBAAAAfpHL6z4wDYsCAAAAAAFZWg==",
+                "rep",
+            ),
+            (
+                "xz_zeros",
+                "/Td6WFoAAAFpIt42AgAhARYAAAB0L+Wj4AH/AAhdAABv/f6zX6gAAHh1qrIAASCABAAAAC72ffo+MA2LAgAAAAABWVo=",
+                "zeros",
+            ),
+            ("xz_empty", "/Td6WFoAAAFpIt42AAAAABzfRCGQQpkNAQAAAAABWVo=", "empty"),
+            (
+                "lzma_text_eos",
+                "XQAAgAD//////////wAqGgiiAyVm8Ut4xaIF/y7m2dIgGq00+OId6EE2+twGabs85BA0Jwnrs2bj7TMwBNlzv41AKQ2LBHAo44JTlhxCuyoZehPT2hpwbghkxbKOqMr8AW69D8OW5EghGwYdCDusB5u/h2lieltWY/aOUrpD3DDuTryEwWP+5nAhA7Ihjy6Tf++zx0Cp//dJaAA=",
+                "text",
+            ),
+            (
+                "lzma_rep",
+                "XQAAgAD//////////wAwmIilg24DT5kt5rFRXFARtr0X2G2eW/TP//r7wAA=",
+                "rep",
+            ),
+            ("lzma_zeros", "XQAAgAD//////////wAAb/3+t+Sz///9zwAA", "zeros"),
+            ("lzma_empty", "XQAAgAD//////////wCD//v//8AAAAA=", "empty"),
         )
 
-        # 3. Thaw in a new engine configured with tiny 4 KiB block size (as on 20 KiB MicroPython)
-        thawed = XZStreamDecompressor.thaw(desc, io.BytesIO(xz_data))
-        # Verify block size can be re-targeted
-        thawed.block_size = 4096
-        thawed.cur_block = bytearray(4096)
-
-        out_blocks = [blk1]
-        while True:
-            b, is_eof = thawed.decode_block()
-            if b:
-                out_blocks.append(b)
-                # Confirm subsequent blocks are at most the new 4 KiB size
-                self.assertLessEqual(len(b), 4096)
-            if is_eof:
-                break
-
-        self.assertEqual(b"".join(out_blocks), raw)
-        thawed.discard_checkpoint(desc)
-
-    def test_freeze_thaw_lifecycle_api(self):
-        lzma = self.lzma
-        import io
-
-        raw = b"FREEZE_THAW_LIFECYCLE_TEST_PAYLOAD_" * 100
-        xz_data = lzma.compress(raw, preset=1)
-        eng = XZStreamDecompressor(io.BytesIO(xz_data))
-        blk, eof = eng.decode_block()
-        self.assertTrue(len(blk) > 0)
-        desc = eng.freeze(
-            resume_dir="/tmp/test_freeze_dir", stream_id="freeze_stream_1"
-        )
-        self.assertEqual(desc.resume_dir, "/tmp/test_freeze_dir")
-        self.assertEqual(desc.resume_id, "freeze_stream_1")
-        thawed = XZStreamDecompressor.thaw(desc, io.BytesIO(xz_data))
-        out = [blk]
-        while True:
-            b, is_eof = thawed.decode_block()
-            if b:
-                out.append(b)
-            if is_eof:
-                break
-        self.assertEqual(b"".join(out), raw)
-        thawed.discard_checkpoint(desc)
-
-    def test_regression_unified_block_sizes(self):
-        lzma = self.lzma
-        import io, random
-
-        prng = random.Random(999)
-        span1 = prng.randbytes(20000)
-        match_str = b"LONG_DISTANCE_MATCH_REGRESSION_PATTERN_" * 10
-        span2 = prng.randbytes(20000)
-        pat_data = span1 + match_str + span2 + match_str
-        xz_data = lzma.compress(pat_data, preset=6)
-
-        for b_sz in [4096, 8192, 16384, 65536]:
-            store = UnifiedHistory(block_size=b_sz)
-            engine = XZStreamDecompressor(
-                io.BytesIO(xz_data), history_backend=store, block_size=b_sz
+        @staticmethod
+        def _baked_raw(key):
+            if key == "empty":
+                return b""
+            if key == "zeros":
+                return bytes(512)
+            if key == "rep":
+                return b"abcabcabd" * 15 + b"0123456789" * 10
+            return (
+                b"The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. "
+                b"How vexingly quick daft zebras jump! Sphinx of black quartz, judge my vow."
             )
-            out = b"".join(
+
+        @staticmethod
+        def _micropython_prepare():
+            TestXZDecompressor.lzma = _MissingLZMA()
+            if "tempfile" not in sys.modules:
+                try:
+                    import tempfile
+                except ImportError:
+                    sys.modules["tempfile"] = _TempfileShim
+
+            if not hasattr(_TestCaseBase, "assertGreater"):
+
+                def assertGreater(self, a, b, msg=None):
+                    if not (a > b):
+                        raise AssertionError(msg or f"{a!r} not greater than {b!r}")
+
+                _TestCaseBase.assertGreater = assertGreater
+
+            if not hasattr(_TestCaseBase, "assertLess"):
+
+                def assertLess(self, a, b, msg=None):
+                    if not (a < b):
+                        raise AssertionError(msg or f"{a!r} not less than {b!r}")
+
+                _TestCaseBase.assertLess = assertLess
+
+            if not hasattr(_TestCaseBase, "assertNotIn"):
+
+                def assertNotIn(self, a, b, msg=None):
+                    if a in b:
+                        raise AssertionError(msg or f"{a!r} unexpectedly in {b!r}")
+
+                _TestCaseBase.assertNotIn = assertNotIn
+
+            def _skipping(fn):
+                def wrapper(self, *a, **k):
+                    try:
+                        return fn(self, *a, **k)
+                    except ImportError as e:
+                        raise unittest.SkipTest(f"missing module: {e}")
+                    except MemoryError:
+                        raise unittest.SkipTest("not enough heap for this test")
+                    except AttributeError as e:
+                        err_s = str(e)
+                        if (
+                            "Random" in err_s
+                            or "randbytes" in err_s
+                            or "RawIOBase" in err_s
+                            or "lzma" in err_s
+                        ):
+                            raise unittest.SkipTest(f"missing feature: {e}")
+                        raise
+
+                return wrapper
+
+            for _n in dir(TestXZDecompressor):
+                if _n.startswith("test_"):
+                    setattr(
+                        TestXZDecompressor,
+                        _n,
+                        _skipping(getattr(TestXZDecompressor, _n)),
+                    )
+
+        def _decode_vec(self, b64_str, pipe=False):
+            import binascii
+
+            data = binascii.a2b_base64(b64_str)
+            if pipe:
+
+                class _Pipe(getattr(io, "RawIOBase", object)):
+                    def __init__(self, d):
+                        self.b = io.BytesIO(d)
+
+                    def read(self, n=-1):
+                        return self.b.read(n)
+
+                    def readable(self):
+                        return True
+
+                    def seekable(self):
+                        return False
+
+                src = _Pipe(data)
+            else:
+                src = io.BytesIO(data)
+            engine = XZStreamDecompressor(src)
+            return b"".join(
                 ev.data
                 for ev in engine.decode_events()
                 if ev.type == XZEventType.CHUNK_OUTPUT
             )
-            self.assertEqual(out, pat_data, f"Failed at block_size={b_sz}")
-            store.cleanup()
 
-    def test_state_dict_strict_assertions(self):
-        d_valid = {"offset": 100, "phase": "CHUNKS", "in_chunk": True, "error": None}
-        _assert_valid_state_dict(d_valid)
+        def test_known_good_pairs_decode(self):
+            for name, b64_str, rawkey in self._BAKED_VECTORS:
+                expected = self._baked_raw(rawkey)
+                for pipe in (False, True):
+                    out = self._decode_vec(b64_str, pipe=pipe)
+                    self.assertEqual(
+                        out, expected, f"Failed baked vector {name} (pipe={pipe})"
+                    )
 
-        with self.assertRaises(AssertionError):
-            _assert_valid_state_dict({"p": array.array("H", [1, 2, 3])})
-        with self.assertRaises(AssertionError):
-            _assert_valid_state_dict({"buf": b"binary_data"})
-        with self.assertRaises(AssertionError):
-            _assert_valid_state_dict({"ba": bytearray(b"bytearray")})
-        with self.assertRaises(AssertionError):
-            _assert_valid_state_dict({"reps": [1, 2, 3, 4]})
-        with self.assertRaises(AssertionError):
-            _assert_valid_state_dict({"pair": [(1, 2), (3, 4)]})
-        with self.assertRaises(AssertionError):
-            _assert_valid_state_dict(
-                {"hex": "0123456789abcdef0123456789abcdef0123456789abcdef"}
-            )
+        def test_known_good_concatenated_flavors(self):
+            xz_vec = None
+            lzma_vec = None
+            for name, b64_str, _ in self._BAKED_VECTORS:
+                if name == "xz_text_crc32":
+                    import binascii
 
-    def test_no_inbuf_when_input_is_seekable(self):
-        # Asserts that when input is a seekable file, no .inbuf file is ever created on disk
-        lzma = self.lzma
-        import io, tempfile
+                    xz_vec = binascii.a2b_base64(b64_str)
+                elif name == "lzma_text_eos":
+                    import binascii
 
-        raw = b"SEEKABLE_INPUT_NO_INBUF_TEST_" * 500
-        xz_data = lzma.compress(raw, preset=1)
-        with tempfile.TemporaryDirectory(prefix="test_no_inbuf_") as td:
-            r_dir = Path(td) / "resume"
-            in_f = Path(td) / "input.xz"
-            out_f = Path(td) / "output.bin"
-            in_f.write_bytes(xz_data)
+                    lzma_vec = binascii.a2b_base64(b64_str)
+            text_raw = self._baked_raw("text")
+            pairs = [
+                ("xz+xz", xz_vec, xz_vec),
+                ("xz+lzma", xz_vec, lzma_vec),
+                ("lzma+xz", lzma_vec, xz_vec),
+                ("lzma+lzma", lzma_vec, lzma_vec),
+            ]
+            for name, c1, c2 in pairs:
+                for pad in [0, 4, 8]:
+                    combined = c1 + (b"\x00" * pad) + c2
+                    engine = XZStreamDecompressor(io.BytesIO(combined))
+                    out = b"".join(
+                        ev.data
+                        for ev in engine.decode_events()
+                        if ev.type == XZEventType.CHUNK_OUTPUT
+                    )
+                    self.assertEqual(
+                        out, text_raw + text_raw, f"Failed concat {name} pad={pad}"
+                    )
 
-            with open(str(in_f), "rb") as in_stream:
-                eng = XZStreamDecompressor(in_stream, block_size=8192)
-                blk, eof = eng.decode_block()
-                self.assertTrue(len(blk) > 0)
-                # Freeze state
-                desc = eng.freeze(resume_dir=str(r_dir), stream_id="seekable_in_stream")
-                # Confirm NO .inbuf file exists!
-                inbuf_files = list(r_dir.glob("*.inbuf"))
+        def test_known_good_truncation_always_rejected(self):
+            import binascii
+
+            for name, b64_str, _ in self._BAKED_VECTORS:
+                if name in ("xz_empty", "lzma_empty"):
+                    continue
+                data = binascii.a2b_base64(b64_str)
+                for cut in (1, 5, len(data) // 2):
+                    if len(data) - cut <= 0:
+                        continue
+                    trunc = data[:-cut]
+                    try:
+                        engine = XZStreamDecompressor(io.BytesIO(trunc))
+                        list(engine.decode_events())
+                    except (XZFormatError, EOFError, XZCheckError, ValueError):
+                        pass
+                    else:
+                        self.fail(
+                            f"Truncated vector {name} (-{cut} bytes) was accepted!"
+                        )
+
+        def test_known_good_vectors_match_oracle(self):
+            lzma = getattr(self, "lzma", None)
+            if lzma is None or isinstance(lzma, _MissingLZMA):
+                self.skipTest("lzma oracle not available")
+            import binascii
+
+            for name, b64_str, rawkey in self._BAKED_VECTORS:
+                data = binascii.a2b_base64(b64_str)
+                expected = self._baked_raw(rawkey)
                 self.assertEqual(
-                    len(inbuf_files),
-                    0,
-                    f"Unexpected .inbuf file created for seekable input: {inbuf_files}",
+                    lzma.decompress(data),
+                    expected,
+                    f"Baked vector {name} diverges from lzma oracle!",
                 )
-                eng.discard_checkpoint(desc)
 
-    def test_no_hist_file_when_output_is_seekable(self):
-        lzma = self.lzma
-        import io, tempfile
+        @classmethod
+        def setUpClass(cls):
+            try:
+                import lzma
 
-        raw = b"SEEKABLE_OUTPUT_NO_HIST_TEST_" * 500
-        xz_data = lzma.compress(raw, preset=1)
-        with tempfile.TemporaryDirectory(prefix="test_no_hist_") as td:
-            r_dir = Path(td) / "resume"
-            out_f = Path(td) / "output.bin"
-            decompress_xz(
-                io.BytesIO(xz_data),
-                str(out_f),
-                resume_dir=str(r_dir),
-                in_place=True,
+                cls.lzma = lzma
+            except ImportError:
+                cls.lzma = _MissingLZMA()
+
+        def setUp(self):
+            self.test_stdout = io.StringIO()
+            self.test_stderr = io.StringIO()
+            if _IS_DESKTOP_PY:
+                self._orig_stderr = sys.stderr
+                self._orig_stdout = sys.stdout
+                self._fake_stdout = io.StringIO()
+                sys.stderr = io.StringIO()
+                sys.stdout = self._fake_stdout
+                self._orig_stdout_buffer = getattr(self._orig_stdout, "buffer", None)
+                if self._orig_stdout_buffer is not None:
+                    self._fake_stdout.buffer = io.BytesIO()
+
+        def tearDown(self):
+            try:
+                import signal
+
+                if hasattr(signal, "setitimer"):
+                    if hasattr(signal, "ITIMER_REAL"):
+                        signal.setitimer(signal.ITIMER_REAL, 0)
+                    if hasattr(signal, "ITIMER_VIRTUAL"):
+                        signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+                elif hasattr(signal, "alarm"):
+                    signal.alarm(0)
+            except Exception:
+                pass
+            if _IS_DESKTOP_PY:
+                if hasattr(self, "_orig_stderr"):
+                    sys.stderr = self._orig_stderr
+                if hasattr(self, "_orig_stdout"):
+                    sys.stdout = self._orig_stdout
+
+        def test_unified_history_engine_protocol(self):
+            storage = MemoryStorage()
+            hist = UnifiedHistory(
+                output_file=None,
+                storage_driver=storage,
+                stream_id="test_stream",
+                ram_cache_bytes=1024,
             )
-            self.assertEqual(out_f.read_bytes(), raw)
-            # Assert that NO .hist file was ever created on disk!
-            hist_files = list(r_dir.glob("*.hist"))
-            self.assertEqual(
-                len(hist_files), 0, f"Unnecessary .hist files generated: {hist_files}"
+            b1 = b"ABCDEFGHIJ" * 50
+            b2 = b"KLMNOPQRST" * 50
+            b3 = b"UVWXYZ0123" * 50
+            hist.append_block(b1)
+            hist.append_block(b2)
+            hist.append_block(b3)
+            self.assertEqual(hist.history_len(), 1500)
+            sl1 = hist.get_history_slice(200, 10)
+            self.assertEqual(sl1, (b2 + b3)[-200:-190])
+            sl2 = hist.get_history_slice(1400, 10)
+            self.assertEqual(sl2, (b1 + b2 + b3)[-1400:-1390])
+            self.assertGreater(hist.tail_crc32(), 0)
+            hist.truncate_to(800)
+            self.assertEqual(hist.history_len(), 800)
+            hist.cleanup()
+
+        def test_unified_history_seekable_file_mode(self):
+            f = io.BytesIO()
+            hist = UnifiedHistory(output_file=f, ram_cache_bytes=512)
+            data = b"SEEKABLE_OUTPUT_FILE_HISTORY_DATA_" * 30
+            f.write(data)
+            hist.append_block(data)
+            self.assertEqual(hist.history_len(), len(data))
+            sl = hist.get_history_slice(len(data), 10)
+            self.assertEqual(sl, data[:10])
+
+        def test_transient_storage_disk_and_memory(self):
+            vfs = MemoryStorage()
+            f = vfs.open("test.bin", "w+b")
+            f.write(b"HELLO_VFS")
+            f.flush()
+            self.assertTrue(vfs.exists("test.bin"))
+            f2 = vfs.open("test.bin", "rb")
+            self.assertEqual(f2.read(), b"HELLO_VFS")
+            vfs.replace("test.bin", "renamed.bin")
+            self.assertFalse(vfs.exists("test.bin"))
+            self.assertTrue(vfs.exists("renamed.bin"))
+            vfs.remove("renamed.bin")
+            self.assertFalse(vfs.exists("renamed.bin"))
+
+        def test_resume_descriptor_ergonomics(self):
+            desc = ResumeDescriptor(
+                resume_dir="/tmp/custom_history",
+                resume_id="stream_42",
+                resume_from=1024,
+                resume_at=4096,
+            )
+            args_str = desc.to_cli_args()
+            self.assertIn("--resume-dir=/tmp/custom_history", args_str)
+            self.assertIn("--resume-id=stream_42", args_str)
+            self.assertIn("--resume-from=1024", args_str)
+            self.assertIn("--resume-at=4096", args_str)
+            desc_seekable = ResumeDescriptor(
+                resume_dir="/tmp/custom_history",
+                resume_id=None,
+                resume_from=None,
+                resume_at=None,
+            )
+            args_seekable = desc_seekable.to_cli_args()
+            self.assertEqual(args_seekable, "--resume-dir=/tmp/custom_history")
+
+        def test_freeze_thaw_block_size_agnostic(self):
+            # Proves that an engine frozen with a large block size (64 KiB) can thaw and
+            # resume cleanly with a tiny microcontroller block size (4 KiB)
+            lzma = self.lzma
+            import io, os
+
+            raw = os.urandom(200000)
+            xz_data = lzma.compress(raw, preset=1)
+
+            # 1. Start engine with large 64 KiB block size
+            eng_large = XZStreamDecompressor(io.BytesIO(xz_data), block_size=65536)
+            blk1, eof = eng_large.decode_block()
+            self.assertEqual(len(blk1), 65536)
+            self.assertFalse(eof)
+
+            # 2. Freeze state
+            desc = eng_large.freeze(
+                resume_dir="/tmp/test_bs_agnostic_dir", stream_id="stream_bs_test"
             )
 
-    def test_truncate_file_portable_fallback(self):
-        import tempfile
+            # 3. Thaw in a new engine configured with tiny 4 KiB block size (as on 20 KiB MicroPython)
+            thawed = XZStreamDecompressor.thaw(desc, io.BytesIO(xz_data))
+            # Verify block size can be re-targeted
+            thawed.block_size = 4096
+            thawed.cur_block = bytearray(4096)
 
-        with tempfile.TemporaryDirectory(prefix="test_trunc_port_") as td:
-            fpath = Path(td) / "test.bin"
-            fpath.write_bytes(b"0123456789" * 10)  # 100 bytes
-            self.assertEqual(fpath.stat().st_size, 100)
+            out_blocks = [blk1]
+            while True:
+                b, is_eof = thawed.decode_block()
+                if b:
+                    out_blocks.append(b)
+                    # Confirm subsequent blocks are at most the new 4 KiB size
+                    self.assertLessEqual(len(b), 4096)
+                if is_eof:
+                    break
 
-            truncate_file_portable(str(fpath), 50)
-            self.assertEqual(fpath.stat().st_size, 50)
-            self.assertEqual(fpath.read_bytes(), b"0123456789" * 5)
+            self.assertEqual(b"".join(out_blocks), raw)
+            thawed.discard_checkpoint(desc)
 
-            truncate_file_portable(str(fpath), 0)
-            self.assertEqual(fpath.stat().st_size, 0)
+        def test_freeze_thaw_lifecycle_api(self):
+            lzma = self.lzma
+            import io
 
-    def test_micropython_bytearray_deletion_compatibility(self):
-        # Rotating blocks strategy: verifies that history rotation executes with zero
-        # slice deletions and zero bytearray reallocations, preventing MicroPython MemoryErrors
-        hist = UnifiedHistory(
-            storage_driver=MemoryStorage(), ram_cache_bytes=65536, block_size=8192
-        )
-        # append 20 blocks
-        for i in range(20):
-            hist.append_block(bytes([i % 256]) * 8192)
-        # Max blocks in RAM must be strictly bounded to max_blocks (8)
-        self.assertLessEqual(len(hist.blocks), 8)
-        self.assertEqual(hist.history_len(), 20 * 8192)
-        # Verify match slices within RAM
-        s = hist.get_history_slice(8192, 10)
-        self.assertEqual(len(s), 10)
+            raw = b"FREEZE_THAW_LIFECYCLE_TEST_PAYLOAD_" * 100
+            xz_data = lzma.compress(raw, preset=1)
+            eng = XZStreamDecompressor(io.BytesIO(xz_data))
+            blk, eof = eng.decode_block()
+            self.assertTrue(len(blk) > 0)
+            desc = eng.freeze(
+                resume_dir="/tmp/test_freeze_dir", stream_id="freeze_stream_1"
+            )
+            self.assertEqual(desc.resume_dir, "/tmp/test_freeze_dir")
+            self.assertEqual(desc.resume_id, "freeze_stream_1")
+            thawed = XZStreamDecompressor.thaw(desc, io.BytesIO(xz_data))
+            out = [blk]
+            while True:
+                b, is_eof = thawed.decode_block()
+                if b:
+                    out.append(b)
+                if is_eof:
+                    break
+            self.assertEqual(b"".join(out), raw)
+            thawed.discard_checkpoint(desc)
 
-    def test_write_back_cache_batching(self):
-        lzma = self.lzma
-        import io
+        def test_regression_unified_block_sizes(self):
+            lzma = self.lzma
+            import io, random
 
-        raw = b"WRITE_BACK_CACHE_BATCH_TEST_" * 50000  # ~1.4 MB
-        xz_data = lzma.compress(raw, preset=1)
+            prng = random.Random(999)
+            span1 = prng.randbytes(20000)
+            match_str = b"LONG_DISTANCE_MATCH_REGRESSION_PATTERN_" * 10
+            span2 = prng.randbytes(20000)
+            pat_data = span1 + match_str + span2 + match_str
+            xz_data = lzma.compress(pat_data, preset=6)
 
-        # 1. Immediate write-through (wb_blocks=1): yields 64k chunks
-        eng_wt = XZStreamDecompressor(
-            io.BytesIO(xz_data), block_size=65536, wb_blocks=1
-        )
-        wt_chunks = [
-            len(ev.data)
-            for ev in eng_wt.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        ]
-        self.assertGreater(len(wt_chunks), 16)
-        self.assertEqual(wt_chunks[0], 65536)
+            for b_sz in [4096, 8192, 16384, 65536]:
+                store = UnifiedHistory(block_size=b_sz)
+                engine = XZStreamDecompressor(
+                    io.BytesIO(xz_data), history_backend=store, block_size=b_sz
+                )
+                out = b"".join(
+                    ev.data
+                    for ev in engine.decode_events()
+                    if ev.type == XZEventType.CHUNK_OUTPUT
+                )
+                self.assertEqual(out, pat_data, f"Failed at block_size={b_sz}")
+                store.cleanup()
 
-        # 2. Write-back cache (wb_blocks=16): yields in 1 MiB batches!
-        eng_wb = XZStreamDecompressor(
-            io.BytesIO(xz_data), block_size=65536, wb_blocks=16
-        )
-        eng_wb.wb_flush_interval = None
-        wb_chunks = [
-            len(ev.data)
-            for ev in eng_wb.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        ]
-        self.assertLess(len(wb_chunks), 5)
-        # First chunk is exactly 16 blocks = 1,048,576 bytes!
-        self.assertEqual(wb_chunks[0], 16 * 65536)
-        # Verify complete uncompressed match
-        eng_full = XZStreamDecompressor(
-            io.BytesIO(xz_data), block_size=65536, wb_blocks=16
-        )
-        eng_full.wb_flush_interval = None
-        full_out = b"".join(
-            bytes(ev.data)
-            for ev in eng_full.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(full_out, raw)
+        def test_state_dict_strict_assertions(self):
+            d_valid = {
+                "offset": 100,
+                "phase": "CHUNKS",
+                "in_chunk": True,
+                "error": None,
+            }
+            _assert_valid_state_dict(d_valid)
 
-    def test_elapsed_time_indication_and_state_clamping(self):
-        lzma = self.lzma
-        import io
+            with self.assertRaises(AssertionError):
+                _assert_valid_state_dict({"p": array.array("H", [1, 2, 3])})
+            with self.assertRaises(AssertionError):
+                _assert_valid_state_dict({"buf": b"binary_data"})
+            with self.assertRaises(AssertionError):
+                _assert_valid_state_dict({"ba": bytearray(b"bytearray")})
+            with self.assertRaises(AssertionError):
+                _assert_valid_state_dict({"reps": [1, 2, 3, 4]})
+            with self.assertRaises(AssertionError):
+                _assert_valid_state_dict({"pair": [(1, 2), (3, 4)]})
+            with self.assertRaises(AssertionError):
+                _assert_valid_state_dict(
+                    {"hex": "0123456789abcdef0123456789abcdef0123456789abcdef"}
+                )
 
-        raw = b"ELAPSED_TIME_STATE_CLAMPING_TEST_" * 100
-        xz_data = lzma.compress(raw, preset=1)
-        eng = XZStreamDecompressor(io.BytesIO(xz_data))
-        blk, eof = eng.decode_block()
-        state = eng.export_state()
-        self.assertIn("elapsed_ms", state)
-        self.assertIsInstance(state["elapsed_ms"], int)
+        def test_no_inbuf_when_input_is_seekable(self):
+            # Asserts that when input is a seekable file, no .inbuf file is ever created on disk
+            lzma = self.lzma
+            import io, tempfile
 
-        # Test uint32 clamping in import_state
-        state["elapsed_ms"] = 0xFFFFFFFF + 5000
-        eng2 = XZStreamDecompressor(io.BytesIO(xz_data))
-        eng2.import_state(state)
-        self.assertEqual(eng2.base_elapsed_ms, 0xFFFFFFFF)
-        state_clamped = eng2.export_state()
-        self.assertEqual(state_clamped["elapsed_ms"], 0xFFFFFFFF)
+            raw = b"SEEKABLE_INPUT_NO_INBUF_TEST_" * 500
+            xz_data = lzma.compress(raw, preset=1)
+            with tempfile.TemporaryDirectory(prefix="test_no_inbuf_") as td:
+                r_dir = Path(td) / "resume"
+                in_f = Path(td) / "input.xz"
+                out_f = Path(td) / "output.bin"
+                in_f.write_bytes(xz_data)
 
-        # Test formatting logic directly
-        time_width = 10
-        # 1. Below clamp
-        import datetime
+                with open(str(in_f), "rb") as in_stream:
+                    eng = XZStreamDecompressor(in_stream, block_size=8192)
+                    blk, eof = eng.decode_block()
+                    self.assertTrue(len(blk) > 0)
+                    # Freeze state
+                    desc = eng.freeze(
+                        resume_dir=str(r_dir), stream_id="seekable_in_stream"
+                    )
+                    # Confirm NO .inbuf file exists!
+                    inbuf_files = list(r_dir.glob("*.inbuf"))
+                    self.assertEqual(
+                        len(inbuf_files),
+                        0,
+                        f"Unexpected .inbuf file created for seekable input: {inbuf_files}",
+                    )
+                    eng.discard_checkpoint(desc)
 
-        td_str = str(datetime.timedelta(seconds=3665))
-        self.assertEqual(f"{td_str:>{time_width}}", "   1:01:05")
-        # 2. Clamped at UINT32_MAX -> all spaces
-        clamped_field = " " * time_width
-        self.assertEqual(clamped_field, "          ")
+        def test_no_hist_file_when_output_is_seekable(self):
+            lzma = self.lzma
+            import io, tempfile
 
-    def test_write_back_cache_disabled_on_memory_storage(self):
-        # Asserts write-back cache is forcibly disabled (wb_blocks=1) when MemoryStorage is used
-        vfs = MemoryStorage()
-        wb_blocks = select_write_back_blocks(
-            65536, available_mem=1024 * 1024 * 1024, storage_driver=vfs
-        )
-        self.assertEqual(wb_blocks, 1)
+            raw = b"SEEKABLE_OUTPUT_NO_HIST_TEST_" * 500
+            xz_data = lzma.compress(raw, preset=1)
+            with tempfile.TemporaryDirectory(prefix="test_no_hist_") as td:
+                r_dir = Path(td) / "resume"
+                out_f = Path(td) / "output.bin"
+                self.decompress_xz(
+                    io.BytesIO(xz_data),
+                    str(out_f),
+                    resume_dir=str(r_dir),
+                    in_place=True,
+                )
+                self.assertEqual(out_f.read_bytes(), raw)
+                # Assert that NO .hist file was ever created on disk!
+                hist_files = list(r_dir.glob("*.hist"))
+                self.assertEqual(
+                    len(hist_files),
+                    0,
+                    f"Unnecessary .hist files generated: {hist_files}",
+                )
 
-        # Asserts write-back cache is forcibly disabled when timeout <= 1.0s
-        wb_tight = select_write_back_blocks(
-            65536, available_mem=1024 * 1024 * 1024, timeout_sec=0.20
-        )
-        self.assertEqual(wb_tight, 1)
+        def test_truncate_file_portable_fallback(self):
+            import tempfile
 
-        # Asserts write-back cache operates when disk storage and ample timeout/RAM exist
-        storage = DiskStorage("/tmp/test_wb_disk")
-        wb_disk = select_write_back_blocks(
-            65536,
-            available_mem=1024 * 1024 * 1024,
-            timeout_sec=52.0,
-            storage_driver=storage,
-        )
-        self.assertEqual(wb_disk, 16)
-        storage.cleanup()
+            with tempfile.TemporaryDirectory(prefix="test_trunc_port_") as td:
+                fpath = Path(td) / "test.bin"
+                fpath.write_bytes(b"0123456789" * 10)  # 100 bytes
+                self.assertEqual(fpath.stat().st_size, 100)
 
-    def test_presets_and_patterns(self):
-        lzma = self.lzma
-        patterns = [
-            b"Hello world! " * 200,
-            bytes(range(256)) * 20,
-            os.urandom(10000) + b"ABCDEFGH" * 1000,
-        ]
-        for pat in patterns:
-            for preset in [0, 1, 6]:
-                xz_data = lzma.compress(pat, preset=preset)
-                engine = XZStreamDecompressor(io.BytesIO(xz_data))
-                out = bytearray()
+                truncate_file_portable(str(fpath), 50)
+                self.assertEqual(fpath.stat().st_size, 50)
+                self.assertEqual(fpath.read_bytes(), b"0123456789" * 5)
+
+                truncate_file_portable(str(fpath), 0)
+                self.assertEqual(fpath.stat().st_size, 0)
+
+        def test_micropython_bytearray_deletion_compatibility(self):
+            # Rotating blocks strategy: verifies that history rotation executes with zero
+            # slice deletions and zero bytearray reallocations, preventing MicroPython MemoryErrors
+            hist = UnifiedHistory(
+                storage_driver=MemoryStorage(), ram_cache_bytes=65536, block_size=8192
+            )
+            # append 20 blocks
+            for i in range(20):
+                hist.append_block(bytes([i % 256]) * 8192)
+            # Max blocks in RAM must be strictly bounded to max_blocks (8)
+            self.assertLessEqual(len(hist.blocks), 8)
+            self.assertEqual(hist.history_len(), 20 * 8192)
+            # Verify match slices within RAM
+            s = hist.get_history_slice(8192, 10)
+            self.assertEqual(len(s), 10)
+
+        def test_write_back_cache_batching(self):
+            lzma = self.lzma
+            import io
+
+            raw = b"WRITE_BACK_CACHE_BATCH_TEST_" * 50000  # ~1.4 MB
+            xz_data = lzma.compress(raw, preset=1)
+
+            # 1. Immediate write-through (wb_blocks=1): yields 64k chunks
+            eng_wt = XZStreamDecompressor(
+                io.BytesIO(xz_data), block_size=65536, wb_blocks=1
+            )
+            wt_chunks = [
+                len(ev.data)
+                for ev in eng_wt.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            ]
+            self.assertGreater(len(wt_chunks), 16)
+            self.assertEqual(wt_chunks[0], 65536)
+
+            # 2. Write-back cache (wb_blocks=16): yields in 1 MiB batches!
+            eng_wb = XZStreamDecompressor(
+                io.BytesIO(xz_data), block_size=65536, wb_blocks=16
+            )
+            eng_wb.wb_flush_interval = None
+            wb_chunks = [
+                len(ev.data)
+                for ev in eng_wb.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            ]
+            self.assertLess(len(wb_chunks), 5)
+            # First chunk is exactly 16 blocks = 1,048,576 bytes!
+            self.assertEqual(wb_chunks[0], 16 * 65536)
+            # Verify complete uncompressed match
+            eng_full = XZStreamDecompressor(
+                io.BytesIO(xz_data), block_size=65536, wb_blocks=16
+            )
+            eng_full.wb_flush_interval = None
+            full_out = b"".join(
+                bytes(ev.data)
+                for ev in eng_full.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(full_out, raw)
+
+        def test_elapsed_time_indication_and_state_clamping(self):
+            lzma = self.lzma
+            import io
+
+            raw = b"ELAPSED_TIME_STATE_CLAMPING_TEST_" * 100
+            xz_data = lzma.compress(raw, preset=1)
+            eng = XZStreamDecompressor(io.BytesIO(xz_data))
+            blk, eof = eng.decode_block()
+            state = eng.export_state()
+            self.assertIn("elapsed_ms", state)
+            self.assertIsInstance(state["elapsed_ms"], int)
+
+            # Test uint32 clamping in import_state
+            state["elapsed_ms"] = 0xFFFFFFFF + 5000
+            eng2 = XZStreamDecompressor(io.BytesIO(xz_data))
+            eng2.import_state(state)
+            self.assertEqual(eng2.base_elapsed_ms, 0xFFFFFFFF)
+            state_clamped = eng2.export_state()
+            self.assertEqual(state_clamped["elapsed_ms"], 0xFFFFFFFF)
+
+            # Test formatting logic directly
+            time_width = 10
+            # 1. Below clamp
+            import datetime
+
+            td_str = str(datetime.timedelta(seconds=3665))
+            self.assertEqual(f"{td_str:>{time_width}}", "   1:01:05")
+            # 2. Clamped at UINT32_MAX -> all spaces
+            clamped_field = " " * time_width
+            self.assertEqual(clamped_field, "          ")
+
+        def test_write_back_cache_disabled_on_memory_storage(self):
+            # Asserts write-back cache is forcibly disabled (wb_blocks=1) when MemoryStorage is used
+            vfs = MemoryStorage()
+            wb_blocks = select_write_back_blocks(
+                65536, available_mem=1024 * 1024 * 1024, storage_driver=vfs
+            )
+            self.assertEqual(wb_blocks, 1)
+
+            # Asserts write-back cache is forcibly disabled when timeout <= 1.0s
+            wb_tight = select_write_back_blocks(
+                65536, available_mem=1024 * 1024 * 1024, timeout_sec=0.20
+            )
+            self.assertEqual(wb_tight, 1)
+
+            # Asserts write-back cache operates when disk storage and ample timeout/RAM exist
+            storage = DiskStorage("/tmp/test_wb_disk")
+            wb_disk = select_write_back_blocks(
+                65536,
+                available_mem=1024 * 1024 * 1024,
+                timeout_sec=52.0,
+                storage_driver=storage,
+            )
+            self.assertEqual(wb_disk, 16)
+            storage.cleanup()
+
+        def test_presets_and_patterns(self):
+            lzma = self.lzma
+            patterns = [
+                b"Hello world! " * 200,
+                bytes(range(256)) * 20,
+                os.urandom(10000) + b"ABCDEFGH" * 1000,
+            ]
+            for pat in patterns:
+                for preset in [0, 1, 6]:
+                    xz_data = lzma.compress(pat, preset=preset)
+                    engine = XZStreamDecompressor(io.BytesIO(xz_data))
+                    out = bytearray()
+                    for ev in engine.decode_events():
+                        if ev.type == XZEventType.CHUNK_OUTPUT:
+                            out.extend(ev.data)
+                    self.assertEqual(bytes(out), pat)
+
+        def test_multi_stream_concatenation_and_padding(self):
+            lzma = self.lzma
+            part1 = b"FIRST_STREAM_CONTENT_" * 100
+            part2 = b"SECOND_STREAM_CONTENT_" * 100
+            xz1 = lzma.compress(part1)
+            xz2 = lzma.compress(part2)
+
+            # Test with 0, 4, 8 null padding bytes
+            for pad_count in [0, 4, 8]:
+                combined = xz1 + (b"\x00" * pad_count) + xz2
+                engine = XZStreamDecompressor(io.BytesIO(combined))
+                streams_seen = []
+                out_slices = []
                 for ev in engine.decode_events():
                     if ev.type == XZEventType.CHUNK_OUTPUT:
-                        out.extend(ev.data)
-                self.assertEqual(bytes(out), pat)
+                        out_slices.append(ev.data)
+                    elif ev.type == XZEventType.STREAM_BOUNDARY:
+                        streams_seen.append(ev)
+                self.assertEqual(len(streams_seen), 2)
+                self.assertEqual(b"".join(out_slices), part1 + part2)
 
-    def test_multi_stream_concatenation_and_padding(self):
-        lzma = self.lzma
-        part1 = b"FIRST_STREAM_CONTENT_" * 100
-        part2 = b"SECOND_STREAM_CONTENT_" * 100
-        xz1 = lzma.compress(part1)
-        xz2 = lzma.compress(part2)
+        def test_verify_output_mode(self):
+            lzma = self.lzma
+            import io
 
-        # Test with 0, 4, 8 null padding bytes
-        for pad_count in [0, 4, 8]:
-            combined = xz1 + (b"\x00" * pad_count) + xz2
-            engine = XZStreamDecompressor(io.BytesIO(combined))
-            streams_seen = []
-            out_slices = []
-            for ev in engine.decode_events():
-                if ev.type == XZEventType.CHUNK_OUTPUT:
-                    out_slices.append(ev.data)
-                elif ev.type == XZEventType.STREAM_BOUNDARY:
-                    streams_seen.append(ev)
-            self.assertEqual(len(streams_seen), 2)
-            self.assertEqual(b"".join(out_slices), part1 + part2)
+            work_dir = Path("/tmp/test_verify_work")
+            out_target = Path("/tmp/test_verify_out.bin")
+            data = b"VERIFY_PAYLOAD_TEST_" * 500
+            xz_data = lzma.compress(data)
 
-    def test_verify_output_mode(self):
-        lzma = self.lzma
-        import io
+            # Write corrupted partial output file
+            out_target.write_bytes(b"WRONG_DATA_AT_START_" + data[20:])
 
-        work_dir = Path("/tmp/test_verify_work")
-        out_target = Path("/tmp/test_verify_out.bin")
-        data = b"VERIFY_PAYLOAD_TEST_" * 500
-        xz_data = lzma.compress(data)
+            # Decompress with resume-dir triggering verify-output mode
+            self.decompress_xz(
+                io.BytesIO(xz_data),
+                str(out_target),
+                resume_dir=str(work_dir),
+                in_place=True,
+            )
+            self.assertEqual(out_target.read_bytes(), data)
+            out_target.unlink(missing_ok=True)
 
-        # Write corrupted partial output file
-        out_target.write_bytes(b"WRONG_DATA_AT_START_" + data[20:])
+        def test_flexible_iso8601_parser(self):
+            cases = [
+                ("20261008", 1791417600.0),
+                ("2026-10-08", 1791417600.0),
+                ("20261008Z", 1791417600.0),
+                ("2026-10-08T00:00:00Z", 1791417600.0),
+                ("20261008T12", 1791460800.0),
+                ("2026-10-08 12:30", 1791462600.0),
+                ("202610081230", 1791462600.0),
+                ("2026-10-08T12:30:45Z", 1791462645.0),
+                ("20261008123045", 1791462645.0),
+                ("2026-10-08T12:30:45.500Z", 1791462645.5),
+                ("20261008123045.500", 1791462645.5),
+            ]
+            for s, expected in cases:
+                self.assertEqual(parse_iso8601_flexible(s), expected)
 
-        # Decompress with resume-dir triggering verify-output mode
-        decompress_xz(
-            io.BytesIO(xz_data),
-            str(out_target),
-            resume_dir=str(work_dir),
-            in_place=True,
-        )
-        self.assertEqual(out_target.read_bytes(), data)
-        out_target.unlink(missing_ok=True)
+        def test_duration_parser(self):
+            self.assertEqual(parse_duration("52s"), 52.0)
+            self.assertEqual(parse_duration("1.5m"), 90.0)
+            self.assertEqual(parse_duration("0"), 0.0)
+            self.assertIsNone(parse_duration(None))
 
-    def test_flexible_iso8601_parser(self):
-        cases = [
-            ("20261008", 1791417600.0),
-            ("2026-10-08", 1791417600.0),
-            ("20261008Z", 1791417600.0),
-            ("2026-10-08T00:00:00Z", 1791417600.0),
-            ("20261008T12", 1791460800.0),
-            ("2026-10-08 12:30", 1791462600.0),
-            ("202610081230", 1791462600.0),
-            ("2026-10-08T12:30:45Z", 1791462645.0),
-            ("20261008123045", 1791462645.0),
-            ("2026-10-08T12:30:45.500Z", 1791462645.5),
-            ("20261008123045.500", 1791462645.5),
-        ]
-        for s, expected in cases:
-            self.assertEqual(parse_iso8601_flexible(s), expected)
+        def test_wall_clock_timeout_cooperative(self):
+            lzma = self.lzma
+            import io
 
-    def test_duration_parser(self):
-        self.assertEqual(parse_duration("52s"), 52.0)
-        self.assertEqual(parse_duration("1.5m"), 90.0)
-        self.assertEqual(parse_duration("0"), 0.0)
-        self.assertIsNone(parse_duration(None))
-
-    def test_wall_clock_timeout_cooperative(self):
-        lzma = self.lzma
-        import io
-
-        data = b"TIMEOUT_TEST_" * 50000
-        xz_data = lzma.compress(data)
-        out_f = Path("/tmp/test_timeout_coop.bin")
-        out_f.unlink(missing_ok=True)
-        try:
-            # Timeout after 0.01 seconds; write to temporary file to avoid stdout bleeding
-            with self.assertRaises(WallClockTimeout):
-                decompress_xz(
-                    io.BytesIO(xz_data),
-                    output_target=str(out_f),
-                    timeout=0.01,
-                    cpu_timeout=0,
-                )
-        finally:
+            data = b"TIMEOUT_TEST_" * 50000
+            xz_data = lzma.compress(data)
+            out_f = Path("/tmp/test_timeout_coop.bin")
             out_f.unlink(missing_ok=True)
-
-    def test_interleaved_resumption_with_serialized_state(self):
-        lzma = self.lzma
-        import random, io
-
-        prng_a = random.Random(42)
-        prng_b = random.Random(1337)
-
-        raw_a = bytearray()
-        for _ in range(200):
-            raw_a.extend(prng_a.randbytes(500))
-            raw_a.extend(b"REPETITIVE_PATTERN_ALPHA_" * 20)
-        raw_a = bytes(raw_a)
-
-        raw_b = bytearray()
-        for _ in range(200):
-            raw_b.extend(prng_b.randbytes(500))
-            raw_b.extend(b"REPETITIVE_PATTERN_BETA__" * 20)
-        raw_b = bytes(raw_b)
-
-        xz_a = lzma.compress(raw_a, preset=9 | lzma.PRESET_EXTREME)
-        xz_b = lzma.compress(raw_b, preset=1)
-
-        stream_a_io = io.BytesIO(xz_a)
-        stream_b_io = io.BytesIO(xz_b)
-
-        desc_a = None
-        desc_b = None
-        eof_a = False
-        eof_b = False
-        out_a = bytearray()
-        out_b = bytearray()
-
-        vfs_a = MemoryStorage()
-        vfs_b = MemoryStorage()
-
-        round_num = 0
-        while not (eof_a and eof_b):
-            round_num += 1
-            if not eof_a:
-                if desc_a is not None:
-                    engine_a = XZStreamDecompressor.thaw(
-                        desc_a, stream_a_io, storage_driver=vfs_a
+            try:
+                # Timeout after 0.01 seconds; write to temporary file to avoid stdout bleeding
+                with self.assertRaises(WallClockTimeout):
+                    self.decompress_xz(
+                        io.BytesIO(xz_data),
+                        output_target=str(out_f),
+                        timeout=0.01,
+                        cpu_timeout=0,
                     )
-                else:
-                    engine_a = XZStreamDecompressor(stream_a_io)
-                blk_a, eof_a = engine_a.decode_block()
-                if blk_a:
-                    out_a.extend(blk_a)
+            finally:
+                out_f.unlink(missing_ok=True)
+
+        def test_interleaved_resumption_with_serialized_state(self):
+            lzma = self.lzma
+            import random, io
+
+            prng_a = random.Random(42)
+            prng_b = random.Random(1337)
+
+            raw_a = bytearray()
+            for _ in range(200):
+                raw_a.extend(prng_a.randbytes(500))
+                raw_a.extend(b"REPETITIVE_PATTERN_ALPHA_" * 20)
+            raw_a = bytes(raw_a)
+
+            raw_b = bytearray()
+            for _ in range(200):
+                raw_b.extend(prng_b.randbytes(500))
+                raw_b.extend(b"REPETITIVE_PATTERN_BETA__" * 20)
+            raw_b = bytes(raw_b)
+
+            xz_a = lzma.compress(raw_a, preset=9 | lzma.PRESET_EXTREME)
+            xz_b = lzma.compress(raw_b, preset=1)
+
+            stream_a_io = io.BytesIO(xz_a)
+            stream_b_io = io.BytesIO(xz_b)
+
+            desc_a = None
+            desc_b = None
+            eof_a = False
+            eof_b = False
+            out_a = bytearray()
+            out_b = bytearray()
+
+            vfs_a = MemoryStorage()
+            vfs_b = MemoryStorage()
+
+            round_num = 0
+            while not (eof_a and eof_b):
+                round_num += 1
                 if not eof_a:
-                    desc_a = engine_a.freeze(
-                        resume_dir="vfs_dir_a",
-                        stream_id="stream_a",
-                        storage_driver=vfs_a,
-                    )
-                del engine_a
+                    if desc_a is not None:
+                        engine_a = XZStreamDecompressor.thaw(
+                            desc_a, stream_a_io, storage_driver=vfs_a
+                        )
+                    else:
+                        engine_a = XZStreamDecompressor(stream_a_io)
+                    blk_a, eof_a = engine_a.decode_block()
+                    if blk_a:
+                        out_a.extend(blk_a)
+                    if not eof_a:
+                        desc_a = engine_a.freeze(
+                            resume_dir="vfs_dir_a",
+                            stream_id="stream_a",
+                            storage_driver=vfs_a,
+                        )
+                    del engine_a
 
-            if not eof_b:
-                if desc_b is not None:
-                    engine_b = XZStreamDecompressor.thaw(
-                        desc_b, stream_b_io, storage_driver=vfs_b
-                    )
-                else:
-                    engine_b = XZStreamDecompressor(stream_b_io)
-                blk_b, eof_b = engine_b.decode_block()
-                if blk_b:
-                    out_b.extend(blk_b)
                 if not eof_b:
-                    desc_b = engine_b.freeze(
-                        resume_dir="vfs_dir_b",
-                        stream_id="stream_b",
-                        storage_driver=vfs_b,
-                    )
-                del engine_b
+                    if desc_b is not None:
+                        engine_b = XZStreamDecompressor.thaw(
+                            desc_b, stream_b_io, storage_driver=vfs_b
+                        )
+                    else:
+                        engine_b = XZStreamDecompressor(stream_b_io)
+                    blk_b, eof_b = engine_b.decode_block()
+                    if blk_b:
+                        out_b.extend(blk_b)
+                    if not eof_b:
+                        desc_b = engine_b.freeze(
+                            resume_dir="vfs_dir_b",
+                            stream_id="stream_b",
+                            storage_driver=vfs_b,
+                        )
+                    del engine_b
 
-        self.assertEqual(bytes(out_a), raw_a)
-        self.assertEqual(bytes(out_b), raw_b)
-        self.assertGreater(round_num, 3)
+            self.assertEqual(bytes(out_a), raw_a)
+            self.assertEqual(bytes(out_b), raw_b)
+            self.assertGreater(round_num, 3)
 
-    def test_block_header_parsing_and_filter_properties(self):
-        lzma = self.lzma
-        import io
+        def test_block_header_parsing_and_filter_properties(self):
+            lzma = self.lzma
+            import io
 
-        data = b"BLOCK_HEADER_FILTER_PROP_TEST_" * 30
-        for preset in [0, 1, 6]:
-            xz_data = lzma.compress(data, preset=preset)
-            engine = XZStreamDecompressor(io.BytesIO(xz_data))
-            out = b"".join(
-                ev.data
-                for ev in engine.decode_events()
-                if ev.type == XZEventType.CHUNK_OUTPUT
-            )
-            self.assertEqual(out, data)
-
-        xz_tampered = bytearray(lzma.compress(data))
-        xz_tampered[13] = 0x01
-        h_sz = (xz_tampered[12] + 1) * 4
-        h_crc = crc32(xz_tampered[12 : 12 + h_sz - 4])
-        xz_tampered[12 + h_sz - 4 : 12 + h_sz] = struct.pack("<I", h_crc)
-        with self.assertRaises(XZUnsupportedError):
-            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_tampered)))
-            list(engine.decode_events())
-
-    def test_block_checks_and_corruption_detection(self):
-        lzma = self.lzma
-        import io
-
-        data = b"CORRUPTION_INTEGRITY_CHECK_TEST_" * 40
-        for chk in [
-            lzma.CHECK_CRC32,
-            lzma.CHECK_CRC64,
-            lzma.CHECK_SHA256,
-            lzma.CHECK_NONE,
-        ]:
-            xz_data = lzma.compress(data, check=chk)
-            engine = XZStreamDecompressor(io.BytesIO(xz_data))
-            out = b"".join(
-                ev.data
-                for ev in engine.decode_events()
-                if ev.type == XZEventType.CHUNK_OUTPUT
-            )
-            self.assertEqual(out, data)
-
-        xz_data_crc = bytearray(lzma.compress(data, check=lzma.CHECK_CRC32))
-        xz_data_crc[-25] ^= 0x55
-        with self.assertRaises((XZCheckError, XZFormatError, ValueError)):
-            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_data_crc)))
-            list(engine.decode_events())
-
-    def test_rfc212_stream_padding_alignment(self):
-        lzma = self.lzma
-        import io
-
-        data = b"PADDING_ALIGNMENT_TEST_" * 20
-        xz1 = lzma.compress(data)
-        xz2 = lzma.compress(data)
-
-        for valid_pad in [0, 4, 8]:
-            stream = xz1 + (b"\x00" * valid_pad) + xz2
-            engine = XZStreamDecompressor(io.BytesIO(stream))
-            out = b"".join(
-                ev.data
-                for ev in engine.decode_events()
-                if ev.type == XZEventType.CHUNK_OUTPUT
-            )
-            self.assertEqual(out, data + data)
-
-        for invalid_pad in [1, 2, 3]:
-            stream = xz1 + (b"\x00" * invalid_pad) + xz2
-            with self.assertRaises(XZFormatError):
-                engine = XZStreamDecompressor(io.BytesIO(stream))
-                list(engine.decode_events())
-
-    def test_multiblock_and_lzma2_resets(self):
-        import io
-
-        b1_data = b"BLOCK_ONE_TEST_STRING_12345" * 10
-        b2_data = b"BLOCK_TWO_TEST_STRING_67890" * 10
-
-        def encode_vli(val):
-            res = bytearray()
-            while val >= 0x80:
-                res.append((val & 0x7F) | 0x80)
-                val >>= 7
-            res.append(val & 0x7F)
-            return bytes(res)
-
-        def make_uncomp_chunk(data, reset=True):
-            ctrl = 0x01 if reset else 0x02
-            sz = len(data) - 1
-            return bytes([ctrl, (sz >> 8) & 0xFF, sz & 0xFF]) + data + b"\x00"
-
-        def build_multiblock(blocks, check_type=4):
-            stream_flags = bytes([0x00, check_type & 0x0F])
-            header = (
-                b"\xfd7zXZ\x00" + stream_flags + struct.pack("<I", crc32(stream_flags))
-            )
-            stream_body = bytearray()
-            index_records = []
-            for uncomp_data, comp_payload in blocks:
-                bh_inner = bytearray([0x00])
-                bh_inner.extend(encode_vli(0x21))
-                bh_inner.extend(encode_vli(1))
-                bh_inner.append(22)
-                target_len = ((len(bh_inner) + 1 + 4 + 3) // 4) * 4
-                pad_needed = target_len - (len(bh_inner) + 1 + 4)
-                bh_inner.extend(b"\x00" * pad_needed)
-                first_byte = (target_len // 4) - 1
-                bh_no_crc = bytes([first_byte]) + bytes(bh_inner)
-                bh = bh_no_crc + struct.pack("<I", crc32(bh_no_crc))
-                block_pad_len = (4 - (len(comp_payload) % 4)) % 4
-                block_pad = b"\x00" * block_pad_len
-                check_bytes = struct.pack("<Q", crc64(uncomp_data))
-                stream_body.extend(bh + comp_payload + block_pad + check_bytes)
-                unpadded_size = len(bh) + len(comp_payload) + len(check_bytes)
-                index_records.append((unpadded_size, len(uncomp_data)))
-            idx_body = bytearray([0x00])
-            idx_body.extend(encode_vli(len(index_records)))
-            for u_sz, unc_sz in index_records:
-                idx_body.extend(encode_vli(u_sz))
-                idx_body.extend(encode_vli(unc_sz))
-            idx_pad_len = (4 - (len(idx_body) % 4)) % 4
-            idx_body.extend(b"\x00" * idx_pad_len)
-            idx_bytes = bytes(idx_body) + struct.pack("<I", crc32(idx_body))
-            backward_size = (len(idx_bytes) // 4) - 1
-            footer_mid = struct.pack("<I", backward_size) + stream_flags
-            footer = struct.pack("<I", crc32(footer_mid)) + footer_mid + b"YZ"
-            return header + bytes(stream_body) + idx_bytes + footer
-
-        c1 = make_uncomp_chunk(b1_data, reset=True)
-        c2 = make_uncomp_chunk(b2_data, reset=True)
-        stream = build_multiblock([(b1_data, c1), (b2_data, c2)], check_type=4)
-
-        engine = XZStreamDecompressor(io.BytesIO(stream))
-        out = b"".join(
-            ev.data
-            for ev in engine.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out, b1_data + b2_data)
-
-    def test_index_and_stream_footer_integrity(self):
-        lzma = self.lzma
-        import io
-
-        data = b"INDEX_FOOTER_INTEGRITY_" * 50
-        xz_data = bytearray(lzma.compress(data))
-
-        xz_bad_footer = bytearray(xz_data)
-        xz_bad_footer[-12] ^= 0xFF
-        with self.assertRaises(XZCheckError):
-            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_bad_footer)))
-            list(engine.decode_events())
-
-        xz_bad_bs = bytearray(xz_data)
-        xz_bad_bs[-8] ^= 0x01
-        new_mid = xz_bad_bs[-8:-2]
-        xz_bad_bs[-12:-8] = struct.pack("<I", crc32(new_mid))
-        with self.assertRaises(XZFormatError):
-            engine = XZStreamDecompressor(io.BytesIO(bytes(xz_bad_bs)))
-            list(engine.decode_events())
-
-    def test_verify_output_mode_multiblock_mismatch(self):
-        lzma = self.lzma
-        import io
-
-        raw = b"ABCDEFGHIJ" * 20000  # 200,000 bytes spanning 4 blocks
-        xz_data = lzma.compress(raw, preset=1)
-
-        work_dir = Path("/tmp/test_verify_multi_work")
-        out_target = Path("/tmp/test_verify_multi_out.bin")
-        corrupt_raw = raw[:80000] + b"CORRUPTED_BYTES" + raw[80015:150000]
-        out_target.write_bytes(corrupt_raw)
-
-        decompress_xz(
-            io.BytesIO(xz_data),
-            str(out_target),
-            resume_dir=str(work_dir),
-            in_place=True,
-        )
-        self.assertEqual(out_target.read_bytes(), raw)
-        out_target.unlink(missing_ok=True)
-
-    def test_proves_right_claim1_distance_indexing(self):
-        lzma = self.lzma
-        import random, io
-
-        prng = random.Random(42)
-        raw = bytearray()
-        for _ in range(100):
-            raw.extend(prng.randbytes(500))
-            raw.extend(b"REPEAT_MATCH_DIST_INVARIANT_" * 20)
-        raw = bytes(raw)
-        xz_data = lzma.compress(raw, preset=9 | lzma.PRESET_EXTREME)
-
-        engine = XZStreamDecompressor(io.BytesIO(xz_data))
-        out = b"".join(
-            ev.data
-            for ev in engine.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out, raw)
-
-    def test_proves_right_claim3_stream_padding_isolation(self):
-        lzma = self.lzma
-        import io
-
-        data1 = b"STREAM_ONE_" * 50
-        data2 = b"STREAM_TWO_" * 50
-        xz1 = lzma.compress(data1)
-        xz2 = lzma.compress(data2)
-
-        # 4 null bytes: valid multiple of 4
-        valid_stream = xz1 + (b"\x00" * 4) + xz2
-        engine_valid = XZStreamDecompressor(io.BytesIO(valid_stream))
-        out_valid = b"".join(
-            ev.data
-            for ev in engine_valid.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out_valid, data1 + data2)
-
-        # 2 null bytes: invalid multiple of 4
-        invalid_stream = xz1 + (b"\x00" * 2) + xz2
-        engine_invalid = XZStreamDecompressor(io.BytesIO(invalid_stream))
-        with self.assertRaises(XZFormatError):
-            list(engine_invalid.decode_events())
-
-    def test_proves_right_claim5_compact_iso8601(self):
-        # Proves that compact date notations without separators parse accurately
-        ts1 = parse_iso8601_flexible("20261008123045")
-        ts2 = parse_iso8601_flexible("20261008123045.500")
-        self.assertEqual(ts1, 1791462645.0)
-        self.assertEqual(ts2, 1791462645.5)
-
-    def test_proves_right_claim6_duration_types(self):
-        # Proves that ints, floats, and strings all parse correctly
-        self.assertEqual(parse_duration(52), 52.0)
-        self.assertEqual(parse_duration(52.0), 52.0)
-        self.assertEqual(parse_duration("52"), 52.0)
-        self.assertEqual(parse_duration("52s"), 52.0)
-        self.assertEqual(parse_duration("1.5m"), 90.0)
-        self.assertEqual(parse_duration(0), 0.0)
-        self.assertEqual(parse_duration("0"), 0.0)
-        self.assertIsNone(parse_duration(None))
-
-    def test_storage_auto_block_size_threshold(self):
-        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 512 KiB RAM), 65536 bytes otherwise
-        micro_mem = 64 * 1024  # 64KB (< 96KB)
-        mid_mem = 256 * 1024  # 256KB (< 512KB)
-        norm_mem = 10 * 1024 * 1024  # 10MB (>= 512KB)
-
-        self.assertEqual(select_block_size("auto", available_mem=micro_mem), 512)
-        self.assertEqual(select_block_size("auto", available_mem=mid_mem), 8192)
-        self.assertEqual(select_block_size("auto", available_mem=norm_mem), 65536)
-
-        # Allowed explicit overrides: 512, 8192, 65536
-        self.assertEqual(select_block_size(512), 512)
-        self.assertEqual(select_block_size("8k"), 8192)
-        self.assertEqual(select_block_size("64k"), 65536)
-        with self.assertRaises(XZFormatError):
-            select_block_size(16384)
-        with self.assertRaises(XZFormatError):
-            select_block_size(4096)
-
-    def test_psram_and_external_storage_detection(self):
-        # Test path selection
-        target_dir, stype = find_preferred_storage_dir(prefix="test_pref_vfs")
-        self.assertIn(stype, ("psram", "external_flash", "local"))
-
-    def test_micropython_decorators_and_gc(self):
-        # Verify decorated functions work identically
-        self.assertEqual(crc32(b"123456789"), 0xCBF43926)
-        self.assertEqual(crc64(b"123456789"), 0x995DC9BBDF1939FA)
-
-        # Test decompress with force_gc=True and force_gc=False
-        lzma = self.lzma
-        import io
-
-        data = b"GC_TEST_PAYLOAD_" * 100
-        xz_data = lzma.compress(data)
-
-        # Force GC enabled
-        eng1 = XZStreamDecompressor(io.BytesIO(xz_data), force_gc=True)
-        out1 = b"".join(
-            ev.data
-            for ev in eng1.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out1, data)
-
-        # Force GC disabled
-        eng2 = XZStreamDecompressor(io.BytesIO(xz_data), force_gc=False)
-        out2 = b"".join(
-            ev.data
-            for ev in eng2.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out2, data)
-
-    def test_circuitpython_import_handling(self):
-        # Test memory size parser
-        self.assertEqual(parse_memory_size("64m"), 64 * 1024 * 1024)
-        self.assertEqual(parse_memory_size("128k"), 128 * 1024)
-        self.assertEqual(parse_memory_size("1g"), 1024 * 1024 * 1024)
-        self.assertEqual(parse_memory_size(262144), 262144)
-        self.assertIsNone(parse_memory_size(None))
-
-    def test_micropython_clock_fallbacks(self):
-        # Verify fallback functions return float timestamps
-        p = _get_perf_counter()
-        c = _get_process_time()
-        self.assertIsInstance(p, float)
-        self.assertIsInstance(c, float)
-        self.assertGreater(p, 0.0)
-        self.assertGreater(c, 0.0)
-
-    def test_regression_rep0_long_zeros(self):
-        lzma = self.lzma
-        import io
-
-        for size in [10000, 100000, 500000]:  # 10k, 100k, 500k all-zeros
-            raw_zeros = bytes(size)
-            for preset in [0, 6]:
-                xz_data = lzma.compress(raw_zeros, preset=preset)
+            data = b"BLOCK_HEADER_FILTER_PROP_TEST_" * 30
+            for preset in [0, 1, 6]:
+                xz_data = lzma.compress(data, preset=preset)
                 engine = XZStreamDecompressor(io.BytesIO(xz_data))
                 out = b"".join(
                     ev.data
                     for ev in engine.decode_events()
                     if ev.type == XZEventType.CHUNK_OUTPUT
                 )
-                self.assertEqual(out, raw_zeros)
+                self.assertEqual(out, data)
 
-    def test_regression_multi_stream_routing(self):
-        lzma = self.lzma
-        import io
+            xz_tampered = bytearray(lzma.compress(data))
+            xz_tampered[13] = 0x01
+            h_sz = (xz_tampered[12] + 1) * 4
+            h_crc = crc32(xz_tampered[12 : 12 + h_sz - 4])
+            xz_tampered[12 + h_sz - 4 : 12 + h_sz] = struct.pack("<I", h_crc)
+            with self.assertRaises(XZUnsupportedError):
+                engine = XZStreamDecompressor(io.BytesIO(bytes(xz_tampered)))
+                list(engine.decode_events())
 
-        s1 = b"STREAM_ZERO_CONTENT_" * 100
-        s2 = b"STREAM_ONE_CONTENT__" * 100
-        xz_multi = lzma.compress(s1) + (b"\x00" * 4) + lzma.compress(s2)
+        def test_block_checks_and_corruption_detection(self):
+            lzma = self.lzma
+            import io
 
-        out_base = Path("/tmp/test_route_out.bin")
-        out_stream1 = Path("/tmp/test_route_out_1.bin")
-        out_base.unlink(missing_ok=True)
-        out_stream1.unlink(missing_ok=True)
+            data = b"CORRUPTION_INTEGRITY_CHECK_TEST_" * 40
+            for chk in [
+                lzma.CHECK_CRC32,
+                lzma.CHECK_CRC64,
+                lzma.CHECK_SHA256,
+                lzma.CHECK_NONE,
+            ]:
+                xz_data = lzma.compress(data, check=chk)
+                engine = XZStreamDecompressor(io.BytesIO(xz_data))
+                out = b"".join(
+                    ev.data
+                    for ev in engine.decode_events()
+                    if ev.type == XZEventType.CHUNK_OUTPUT
+                )
+                self.assertEqual(out, data)
 
-        decompress_xz(io.BytesIO(xz_multi), str(out_base), in_place=True)
+            xz_data_crc = bytearray(lzma.compress(data, check=lzma.CHECK_CRC32))
+            xz_data_crc[-25] ^= 0x55
+            with self.assertRaises((XZCheckError, XZFormatError, ValueError)):
+                engine = XZStreamDecompressor(io.BytesIO(bytes(xz_data_crc)))
+                list(engine.decode_events())
 
-        self.assertTrue(out_base.exists())
-        self.assertTrue(out_stream1.exists())
-        self.assertEqual(out_base.read_bytes(), s1)
-        self.assertEqual(out_stream1.read_bytes(), s2)
+        def test_rfc212_stream_padding_alignment(self):
+            lzma = self.lzma
+            import io
 
-        out_base.unlink(missing_ok=True)
-        out_stream1.unlink(missing_ok=True)
+            data = b"PADDING_ALIGNMENT_TEST_" * 20
+            xz1 = lzma.compress(data)
+            xz2 = lzma.compress(data)
 
-    def test_regression_empty_input_stream(self):
-        lzma = self.lzma
-        import io
+            for valid_pad in [0, 4, 8]:
+                stream = xz1 + (b"\x00" * valid_pad) + xz2
+                engine = XZStreamDecompressor(io.BytesIO(stream))
+                out = b"".join(
+                    ev.data
+                    for ev in engine.decode_events()
+                    if ev.type == XZEventType.CHUNK_OUTPUT
+                )
+                self.assertEqual(out, data + data)
 
-        empty_xz = lzma.compress(b"")
-        out_empty = Path("/tmp/test_empty_stream.bin")
-        out_empty.unlink(missing_ok=True)
+            for invalid_pad in [1, 2, 3]:
+                stream = xz1 + (b"\x00" * invalid_pad) + xz2
+                with self.assertRaises(XZFormatError):
+                    engine = XZStreamDecompressor(io.BytesIO(stream))
+                    list(engine.decode_events())
 
-        decompress_xz(io.BytesIO(empty_xz), str(out_empty), in_place=True)
+        def test_multiblock_and_lzma2_resets(self):
+            import io
 
-        self.assertTrue(out_empty.exists())
-        self.assertEqual(out_empty.stat().st_size, 0)
-        out_empty.unlink(missing_ok=True)
+            b1_data = b"BLOCK_ONE_TEST_STRING_12345" * 10
+            b2_data = b"BLOCK_TWO_TEST_STRING_67890" * 10
 
-    def test_durable_replay_input_rolling_rebase_bounded(self):
-        import tempfile, io
+            def encode_vli(val):
+                res = bytearray()
+                while val >= 0x80:
+                    res.append((val & 0x7F) | 0x80)
+                    val >>= 7
+                res.append(val & 0x7F)
+                return bytes(res)
 
-        with tempfile.TemporaryDirectory(prefix="test_spool_bound_") as td:
-            spool_p = Path(td) / "INPUT_BUFFER.bin"
-            # Simulate streaming 500 KiB in 50 KiB increments
-            source = io.BytesIO(b"MOCK_STREAMED_PIPE_CHUNK_" * 20000)
-            inp = DurableReplayInput(source, spool_p)
-            for commit_step in range(1, 10):
-                chunk = inp.read(50000)
-                self.assertEqual(len(chunk), 50000)
-                # Rebase at commit point (leaving at most 4 KiB read-ahead)
-                inp.rebase_to(commit_step * 48000)
-                # File size on disk must strictly stay under 64 KiB!
-                spool_sz = spool_p.stat().st_size
-                self.assertLessEqual(spool_sz, 65536)
-            inp.close()
+            def make_uncomp_chunk(data, reset=True):
+                ctrl = 0x01 if reset else 0x02
+                sz = len(data) - 1
+                return bytes([ctrl, (sz >> 8) & 0xFF, sz & 0xFF]) + data + b"\x00"
 
-    def test_durable_replay_input_replays_post_checkpoint_read_ahead(self):
-        import tempfile
-        import io
+            def build_multiblock(blocks, check_type=4):
+                stream_flags = bytes([0x00, check_type & 0x0F])
+                header = (
+                    b"\xfd7zXZ\x00"
+                    + stream_flags
+                    + struct.pack("<I", crc32(stream_flags))
+                )
+                stream_body = bytearray()
+                index_records = []
+                for uncomp_data, comp_payload in blocks:
+                    bh_inner = bytearray([0x00])
+                    bh_inner.extend(encode_vli(0x21))
+                    bh_inner.extend(encode_vli(1))
+                    bh_inner.append(22)
+                    target_len = ((len(bh_inner) + 1 + 4 + 3) // 4) * 4
+                    pad_needed = target_len - (len(bh_inner) + 1 + 4)
+                    bh_inner.extend(b"\x00" * pad_needed)
+                    first_byte = (target_len // 4) - 1
+                    bh_no_crc = bytes([first_byte]) + bytes(bh_inner)
+                    bh = bh_no_crc + struct.pack("<I", crc32(bh_no_crc))
+                    block_pad_len = (4 - (len(comp_payload) % 4)) % 4
+                    block_pad = b"\x00" * block_pad_len
+                    check_bytes = struct.pack("<Q", crc64(uncomp_data))
+                    stream_body.extend(bh + comp_payload + block_pad + check_bytes)
+                    unpadded_size = len(bh) + len(comp_payload) + len(check_bytes)
+                    index_records.append((unpadded_size, len(uncomp_data)))
+                idx_body = bytearray([0x00])
+                idx_body.extend(encode_vli(len(index_records)))
+                for u_sz, unc_sz in index_records:
+                    idx_body.extend(encode_vli(u_sz))
+                    idx_body.extend(encode_vli(unc_sz))
+                idx_pad_len = (4 - (len(idx_body) % 4)) % 4
+                idx_body.extend(b"\x00" * idx_pad_len)
+                idx_bytes = bytes(idx_body) + struct.pack("<I", crc32(idx_body))
+                backward_size = (len(idx_bytes) // 4) - 1
+                footer_mid = struct.pack("<I", backward_size) + stream_flags
+                footer = struct.pack("<I", crc32(footer_mid)) + footer_mid + b"YZ"
+                return header + bytes(stream_body) + idx_bytes + footer
 
-        with tempfile.TemporaryDirectory(prefix="xz_input_replay_") as td:
-            spool = Path(td) / "INPUT_BUFFER.bin"
-            source = io.BytesIO(b"abcdefghij")
-            first = DurableReplayInput(source, spool)
-            self.assertEqual(first.read(4), b"abcd")
-            committed_offset = first.durable_offset()
-            # Simulate read-ahead after the last checkpoint.
-            self.assertEqual(first.read(3), b"efg")
-            first.sync()
-            first._spool.close()
+            c1 = make_uncomp_chunk(b1_data, reset=True)
+            c2 = make_uncomp_chunk(b2_data, reset=True)
+            stream = build_multiblock([(b1_data, c1), (b2_data, c2)], check_type=4)
 
-            continuation = io.BytesIO(b"hijklmnop")
-            restored = DurableReplayInput(continuation, spool)
-            restored.set_replay_offset(committed_offset)
-            replayed = bytearray()
-            while len(replayed) < 6:
-                chunk = restored.read(6 - len(replayed))
-                if not chunk:
+            engine = XZStreamDecompressor(io.BytesIO(stream))
+            out = b"".join(
+                ev.data
+                for ev in engine.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out, b1_data + b2_data)
+
+        def test_index_and_stream_footer_integrity(self):
+            lzma = self.lzma
+            import io
+
+            data = b"INDEX_FOOTER_INTEGRITY_" * 50
+            xz_data = bytearray(lzma.compress(data))
+
+            xz_bad_footer = bytearray(xz_data)
+            xz_bad_footer[-12] ^= 0xFF
+            with self.assertRaises(XZCheckError):
+                engine = XZStreamDecompressor(io.BytesIO(bytes(xz_bad_footer)))
+                list(engine.decode_events())
+
+            xz_bad_bs = bytearray(xz_data)
+            xz_bad_bs[-8] ^= 0x01
+            new_mid = xz_bad_bs[-8:-2]
+            xz_bad_bs[-12:-8] = struct.pack("<I", crc32(new_mid))
+            with self.assertRaises(XZFormatError):
+                engine = XZStreamDecompressor(io.BytesIO(bytes(xz_bad_bs)))
+                list(engine.decode_events())
+
+        def test_verify_output_mode_multiblock_mismatch(self):
+            lzma = self.lzma
+            import io
+
+            raw = b"ABCDEFGHIJ" * 20000  # 200,000 bytes spanning 4 blocks
+            xz_data = lzma.compress(raw, preset=1)
+
+            work_dir = Path("/tmp/test_verify_multi_work")
+            out_target = Path("/tmp/test_verify_multi_out.bin")
+            corrupt_raw = raw[:80000] + b"CORRUPTED_BYTES" + raw[80015:150000]
+            out_target.write_bytes(corrupt_raw)
+
+            self.decompress_xz(
+                io.BytesIO(xz_data),
+                str(out_target),
+                resume_dir=str(work_dir),
+                in_place=True,
+            )
+            self.assertEqual(out_target.read_bytes(), raw)
+            out_target.unlink(missing_ok=True)
+
+        def test_proves_right_claim1_distance_indexing(self):
+            lzma = self.lzma
+            import random, io
+
+            prng = random.Random(42)
+            raw = bytearray()
+            for _ in range(100):
+                raw.extend(prng.randbytes(500))
+                raw.extend(b"REPEAT_MATCH_DIST_INVARIANT_" * 20)
+            raw = bytes(raw)
+            xz_data = lzma.compress(raw, preset=9 | lzma.PRESET_EXTREME)
+
+            engine = XZStreamDecompressor(io.BytesIO(xz_data))
+            out = b"".join(
+                ev.data
+                for ev in engine.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out, raw)
+
+        def test_proves_right_claim3_stream_padding_isolation(self):
+            lzma = self.lzma
+            import io
+
+            data1 = b"STREAM_ONE_" * 50
+            data2 = b"STREAM_TWO_" * 50
+            xz1 = lzma.compress(data1)
+            xz2 = lzma.compress(data2)
+
+            # 4 null bytes: valid multiple of 4
+            valid_stream = xz1 + (b"\x00" * 4) + xz2
+            engine_valid = XZStreamDecompressor(io.BytesIO(valid_stream))
+            out_valid = b"".join(
+                ev.data
+                for ev in engine_valid.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out_valid, data1 + data2)
+
+            # 2 null bytes: invalid multiple of 4
+            invalid_stream = xz1 + (b"\x00" * 2) + xz2
+            engine_invalid = XZStreamDecompressor(io.BytesIO(invalid_stream))
+            with self.assertRaises(XZFormatError):
+                list(engine_invalid.decode_events())
+
+        def test_proves_right_claim5_compact_iso8601(self):
+            # Proves that compact date notations without separators parse accurately
+            ts1 = parse_iso8601_flexible("20261008123045")
+            ts2 = parse_iso8601_flexible("20261008123045.500")
+            self.assertEqual(ts1, 1791462645.0)
+            self.assertEqual(ts2, 1791462645.5)
+
+        def test_proves_right_claim6_duration_types(self):
+            # Proves that ints, floats, and strings all parse correctly
+            self.assertEqual(parse_duration(52), 52.0)
+            self.assertEqual(parse_duration(52.0), 52.0)
+            self.assertEqual(parse_duration("52"), 52.0)
+            self.assertEqual(parse_duration("52s"), 52.0)
+            self.assertEqual(parse_duration("1.5m"), 90.0)
+            self.assertEqual(parse_duration(0), 0.0)
+            self.assertEqual(parse_duration("0"), 0.0)
+            self.assertIsNone(parse_duration(None))
+
+        def test_storage_auto_block_size_threshold(self):
+            # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 512 KiB RAM), 65536 bytes otherwise
+            micro_mem = 64 * 1024  # 64KB (< 96KB)
+            mid_mem = 256 * 1024  # 256KB (< 512KB)
+            norm_mem = 10 * 1024 * 1024  # 10MB (>= 512KB)
+
+            self.assertEqual(select_block_size("auto", available_mem=micro_mem), 512)
+            self.assertEqual(select_block_size("auto", available_mem=mid_mem), 8192)
+            self.assertEqual(select_block_size("auto", available_mem=norm_mem), 65536)
+
+            # Allowed explicit overrides: 512, 8192, 65536
+            self.assertEqual(select_block_size(512), 512)
+            self.assertEqual(select_block_size("8k"), 8192)
+            self.assertEqual(select_block_size("64k"), 65536)
+            with self.assertRaises(XZFormatError):
+                select_block_size(16384)
+            with self.assertRaises(XZFormatError):
+                select_block_size(4096)
+
+        def test_psram_and_external_storage_detection(self):
+            # Test path selection
+            target_dir, stype = find_preferred_storage_dir(prefix="test_pref_vfs")
+            self.assertIn(stype, ("psram", "external_flash", "local"))
+
+        def test_micropython_decorators_and_gc(self):
+            # Verify decorated functions work identically
+            self.assertEqual(crc32(b"123456789"), 0xCBF43926)
+            self.assertEqual(crc64(b"123456789"), 0x995DC9BBDF1939FA)
+
+            # Test decompress with force_gc=True and force_gc=False
+            lzma = self.lzma
+            import io
+
+            data = b"GC_TEST_PAYLOAD_" * 100
+            xz_data = lzma.compress(data)
+
+            # Force GC enabled
+            eng1 = XZStreamDecompressor(io.BytesIO(xz_data), force_gc=True)
+            out1 = b"".join(
+                ev.data
+                for ev in eng1.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out1, data)
+
+            # Force GC disabled
+            eng2 = XZStreamDecompressor(io.BytesIO(xz_data), force_gc=False)
+            out2 = b"".join(
+                ev.data
+                for ev in eng2.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out2, data)
+
+        def test_circuitpython_import_handling(self):
+            # Test memory size parser
+            self.assertEqual(parse_memory_size("64m"), 64 * 1024 * 1024)
+            self.assertEqual(parse_memory_size("128k"), 128 * 1024)
+            self.assertEqual(parse_memory_size("1g"), 1024 * 1024 * 1024)
+            self.assertEqual(parse_memory_size(262144), 262144)
+            self.assertIsNone(parse_memory_size(None))
+
+        def test_micropython_clock_fallbacks(self):
+            # Verify fallback functions return float timestamps
+            p = _get_perf_counter()
+            c = _get_process_time()
+            self.assertIsInstance(p, float)
+            self.assertIsInstance(c, float)
+            self.assertGreater(p, 0.0)
+            self.assertGreater(c, 0.0)
+
+        def test_regression_rep0_long_zeros(self):
+            lzma = self.lzma
+            import io
+
+            for size in [10000, 100000, 500000]:  # 10k, 100k, 500k all-zeros
+                raw_zeros = bytes(size)
+                for preset in [0, 6]:
+                    xz_data = lzma.compress(raw_zeros, preset=preset)
+                    engine = XZStreamDecompressor(io.BytesIO(xz_data))
+                    out = b"".join(
+                        ev.data
+                        for ev in engine.decode_events()
+                        if ev.type == XZEventType.CHUNK_OUTPUT
+                    )
+                    self.assertEqual(out, raw_zeros)
+
+        def test_regression_multi_stream_routing(self):
+            lzma = self.lzma
+            import io
+
+            s1 = b"STREAM_ZERO_CONTENT_" * 100
+            s2 = b"STREAM_ONE_CONTENT__" * 100
+            xz_multi = lzma.compress(s1) + (b"\x00" * 4) + lzma.compress(s2)
+
+            out_base = Path("/tmp/test_route_out.bin")
+            out_stream1 = Path("/tmp/test_route_out_1.bin")
+            out_base.unlink(missing_ok=True)
+            out_stream1.unlink(missing_ok=True)
+
+            self.decompress_xz(io.BytesIO(xz_multi), str(out_base), in_place=True)
+
+            self.assertTrue(out_base.exists())
+            self.assertTrue(out_stream1.exists())
+            self.assertEqual(out_base.read_bytes(), s1)
+            self.assertEqual(out_stream1.read_bytes(), s2)
+
+            out_base.unlink(missing_ok=True)
+            out_stream1.unlink(missing_ok=True)
+
+        def test_regression_empty_input_stream(self):
+            lzma = self.lzma
+            import io
+
+            empty_xz = lzma.compress(b"")
+            out_empty = Path("/tmp/test_empty_stream.bin")
+            out_empty.unlink(missing_ok=True)
+
+            self.decompress_xz(io.BytesIO(empty_xz), str(out_empty), in_place=True)
+
+            self.assertTrue(out_empty.exists())
+            self.assertEqual(out_empty.stat().st_size, 0)
+            out_empty.unlink(missing_ok=True)
+
+        def test_durable_replay_input_rolling_rebase_bounded(self):
+            import tempfile, io
+
+            with tempfile.TemporaryDirectory(prefix="test_spool_bound_") as td:
+                spool_p = Path(td) / "INPUT_BUFFER.bin"
+                # Simulate streaming 500 KiB in 50 KiB increments
+                source = io.BytesIO(b"MOCK_STREAMED_PIPE_CHUNK_" * 20000)
+                inp = DurableReplayInput(source, spool_p)
+                for commit_step in range(1, 10):
+                    chunk = inp.read(50000)
+                    self.assertEqual(len(chunk), 50000)
+                    # Rebase at commit point (leaving at most 4 KiB read-ahead)
+                    inp.rebase_to(commit_step * 48000)
+                    # File size on disk must strictly stay under 64 KiB!
+                    spool_sz = spool_p.stat().st_size
+                    self.assertLessEqual(spool_sz, 65536)
+                inp.close()
+
+        def test_durable_replay_input_replays_post_checkpoint_read_ahead(self):
+            import tempfile
+            import io
+
+            with tempfile.TemporaryDirectory(prefix="xz_input_replay_") as td:
+                spool = Path(td) / "INPUT_BUFFER.bin"
+                source = io.BytesIO(b"abcdefghij")
+                first = DurableReplayInput(source, spool)
+                self.assertEqual(first.read(4), b"abcd")
+                committed_offset = first.durable_offset()
+                # Simulate read-ahead after the last checkpoint.
+                self.assertEqual(first.read(3), b"efg")
+                first.sync()
+                first._spool.close()
+
+                continuation = io.BytesIO(b"hijklmnop")
+                restored = DurableReplayInput(continuation, spool)
+                restored.set_replay_offset(committed_offset)
+                replayed = bytearray()
+                while len(replayed) < 6:
+                    chunk = restored.read(6 - len(replayed))
+                    if not chunk:
+                        break
+                    replayed.extend(chunk)
+                self.assertEqual(bytes(replayed), b"efghij")
+                self.assertEqual(restored.read(6), b"klmnop")
+                restored._spool.close()
+
+        def test_regression_non_seekable_input(self):
+            lzma = self.lzma
+            data = b"PIPE_NON_SEEKABLE_DATA_" * 500
+            xz_data = lzma.compress(data)
+
+            class NonSeekablePipe(getattr(io, "RawIOBase", object)):
+                def __init__(self, raw_bytes):
+                    self.buf = io.BytesIO(raw_bytes)
+
+                def read(self, n=-1):
+                    return self.buf.read(n)
+
+                def readable(self):
+                    return True
+
+                def seekable(self):
+                    return False
+
+                def seek(self, *args):
+                    raise OSError(29, "Illegal seek")
+
+                def tell(self):
+                    raise OSError(29, "Illegal seek")
+
+            pipe = NonSeekablePipe(xz_data)
+            engine = XZStreamDecompressor(pipe)
+            out = b"".join(
+                ev.data
+                for ev in engine.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out, data)
+
+        def test_regression_checkpoint_resume_convergence(self):
+            lzma = self.lzma
+            if lzma is None or isinstance(lzma, _MissingLZMA):
+                self.skipTest("lzma oracle not available")
+            import os
+            import tempfile
+
+            raw = os.urandom(512 * 1024)
+            xz_data = lzma.compress(raw, preset=1)
+
+            ram_dir_base = None
+            for cand in ["/dev/shm", "/vfs_ram", "/ramdisk", "/psram"]:
+                if Path(cand).is_dir() and (
+                    os.access(cand, os.W_OK) if hasattr(os, "access") else True
+                ):
+                    ram_dir_base = cand
                     break
-                replayed.extend(chunk)
-            self.assertEqual(bytes(replayed), b"efghij")
-            self.assertEqual(restored.read(6), b"klmnop")
-            restored._spool.close()
 
-    def test_regression_non_seekable_input(self):
-        lzma = self.lzma
-        data = b"PIPE_NON_SEEKABLE_DATA_" * 500
-        xz_data = lzma.compress(data)
+            orig_fsync_obj = globals().get("_fsync_fileobj")
+            orig_fsync_parent = globals().get("_fsync_parent")
+            globals()["_fsync_fileobj"] = lambda x: None
+            globals()["_fsync_parent"] = lambda x: None
 
-        class NonSeekablePipe(io.RawIOBase):
-            def __init__(self, raw_bytes):
-                self.buf = io.BytesIO(raw_bytes)
-
-            def read(self, n=-1):
-                return self.buf.read(n)
-
-            def readable(self):
-                return True
-
-            def seekable(self):
-                return False
-
-            def seek(self, *args):
-                raise OSError(29, "Illegal seek")
-
-            def tell(self):
-                raise OSError(29, "Illegal seek")
-
-        pipe = NonSeekablePipe(xz_data)
-        engine = XZStreamDecompressor(pipe)
-        out = b"".join(
-            ev.data
-            for ev in engine.decode_events()
-            if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out, data)
-
-    def test_regression_checkpoint_resume_convergence(self):
-        lzma = self.lzma
-        if lzma is None:
-            self.skipTest("lzma oracle not available")
-        import os
-        import tempfile
-
-        raw = os.urandom(512 * 1024)
-        xz_data = lzma.compress(raw, preset=1)
-
-        ram_dir_base = None
-        for cand in ["/dev/shm", "/vfs_ram", "/ramdisk", "/psram"]:
-            if os.path.isdir(cand) and os.access(cand, os.W_OK):
-                ram_dir_base = cand
-                break
-
-        orig_fsync_obj = globals().get("_fsync_fileobj")
-        orig_fsync_parent = globals().get("_fsync_parent")
-        globals()["_fsync_fileobj"] = lambda x: None
-        globals()["_fsync_parent"] = lambda x: None
-
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix="test_ckpt_converge_", dir=ram_dir_base
-            ) as td:
-                root = Path(td)
-                in_f = root / "input.xz"
-                out_f = root / "output.bin"
-                r_dir = root / "resume"
-                in_f.write_bytes(xz_data)
-                t_val = 0.15
-                timed_out = False
-                completed = False
-                for _scale_pass in range(6):
-                    out_f.unlink(missing_ok=True)
-                    for f in r_dir.glob("*"):
-                        try:
-                            f.unlink()
-                        except OSError:
-                            pass
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="test_ckpt_converge_", dir=ram_dir_base
+                ) as td:
+                    root = Path(td)
+                    in_f = root / "input.xz"
+                    out_f = root / "output.bin"
+                    r_dir = root / "resume"
+                    in_f.write_bytes(xz_data)
+                    t_val = 0.15
                     timed_out = False
                     completed = False
-                    for _attempt in range(40):
+                    for _scale_pass in range(6):
+                        out_f.unlink(missing_ok=True)
+                        for f in r_dir.glob("*"):
+                            try:
+                                f.unlink()
+                            except OSError:
+                                pass
+                        timed_out = False
+                        completed = False
+                        for _attempt in range(40):
+                            try:
+                                self.decompress_xz(
+                                    str(in_f),
+                                    str(out_f),
+                                    resume_dir=str(r_dir),
+                                    resume_mode="auto",
+                                    timeout=t_val,
+                                    cpu_timeout=t_val,
+                                    block_size=8192,
+                                    checkpoint_interval="16k",
+                                    in_place=True,
+                                    write_back_cache=1,
+                                )
+                                completed = True
+                                break
+                            except (WallClockTimeout, CPUTimeout):
+                                timed_out = True
+
+                        if completed and timed_out:
+                            break
+                        if completed and not timed_out:
+                            # Finished before timeout fired: machine is fast, scale down timeout
+                            t_val = max(0.005, t_val / 4.0)
+
+                    self.assertTrue(
+                        timed_out, "test must exercise interrupted invocations"
+                    )
+                    self.assertTrue(
+                        completed, "resumption did not converge within attempts"
+                    )
+                    self.assertEqual(out_f.read_bytes(), raw)
+            finally:
+                if orig_fsync_obj is not None:
+                    globals()["_fsync_fileobj"] = orig_fsync_obj
+                if orig_fsync_parent is not None:
+                    globals()["_fsync_parent"] = orig_fsync_parent
+
+        def test_regression_checkpoint_resume_convergence_compressed(self):
+            lzma = self.lzma
+            if lzma is None or isinstance(lzma, _MissingLZMA):
+                self.skipTest("lzma oracle not available")
+            import os
+            import tempfile
+            import time
+
+            ram_dir_base = None
+            for cand in ["/dev/shm", "/vfs_ram", "/ramdisk", "/psram"]:
+                if Path(cand).is_dir() and (
+                    os.access(cand, os.W_OK) if hasattr(os, "access") else True
+                ):
+                    ram_dir_base = cand
+                    break
+
+            orig_fsync_obj = globals().get("_fsync_fileobj")
+            orig_fsync_parent = globals().get("_fsync_parent")
+            globals()["_fsync_fileobj"] = lambda x: None
+            globals()["_fsync_parent"] = lambda x: None
+
+            def make_input(n):
+                # 6-bit-entropy bytes: real range-decoding work, so decode time
+                # scales with n (pure random data would be stored uncompressed).
+                raw = bytes(b & 0x3F for b in os.urandom(n))
+                return raw, lzma.compress(raw, preset=1)
+
+            def full_run(root, name, xz_data):
+                in_f = root / (name + ".xz")
+                out_f = root / (name + ".bin")
+                in_f.write_bytes(xz_data)
+                t0 = time.time()
+                self.decompress_xz(
+                    str(in_f),
+                    str(out_f),
+                    timeout=0,
+                    cpu_timeout=0,
+                    block_size=8192,
+                    in_place=True,
+                    write_back_cache=1,
+                )
+                return time.time() - t0
+
+            # Calibration: grow the input until one uninterrupted decode takes long
+            # enough to be interrupted reliably, then derive the timeout from the
+            # measured time so the test self-adjusts to the machine's speed.
+            min_full = 0.4
+            max_size = 8 * 1024 * 1024
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="test_ckpt_converge_", dir=ram_dir_base
+                ) as td:
+                    root = Path(td)
+                    size = 64 * 1024
+                    while True:
+                        raw, xz_data = make_input(size)
+                        full = full_run(root, "calib", xz_data)
+                        if full >= min_full or size >= max_size:
+                            break
+                        # aim past min_full in one step when the estimate is usable
+                        grow = int(
+                            size * min(8.0, max(2.0, 1.5 * min_full / max(full, 1e-4)))
+                        )
+                        size = min(max_size, grow)
+                    if full < 0.1:
+                        self.skipTest(
+                            "decoder too fast to exercise interruption at max test size"
+                        )
+                    # ~1/5 of an uninterrupted run => several forced interruptions
+                    tmo = max(0.02, full / 5.0)
+
+                    in_f = root / "input.xz"
+                    out_f = root / "output.bin"
+                    r_dir = root / "resume"
+                    in_f.write_bytes(xz_data)
+                    timed_out = 0
+                    completed = False
+                    max_attempts = 200
+                    for _attempt in range(max_attempts):
                         try:
-                            decompress_xz(
+                            self.decompress_xz(
                                 str(in_f),
                                 str(out_f),
                                 resume_dir=str(r_dir),
                                 resume_mode="auto",
-                                timeout=t_val,
-                                cpu_timeout=t_val,
+                                timeout=tmo,
+                                cpu_timeout=tmo,
                                 block_size=8192,
                                 checkpoint_interval="16k",
                                 in_place=True,
@@ -5997,688 +6491,684 @@ class TestXZDecompressor(_TestCaseBase):
                             completed = True
                             break
                         except (WallClockTimeout, CPUTimeout):
-                            timed_out = True
+                            timed_out += 1
+                    self.assertTrue(
+                        timed_out > 0,
+                        "test must exercise interrupted invocations "
+                        "(full run %.3fs, timeout %.3fs)" % (full, tmo),
+                    )
+                    self.assertTrue(
+                        completed,
+                        "resumption did not converge within %d attempts "
+                        "(timeout %.3fs, %d interruptions)"
+                        % (max_attempts, tmo, timed_out),
+                    )
+                    self.assertEqual(out_f.read_bytes(), raw)
+            finally:
+                if orig_fsync_obj is not None:
+                    globals()["_fsync_fileobj"] = orig_fsync_obj
+                if orig_fsync_parent is not None:
+                    globals()["_fsync_parent"] = orig_fsync_parent
 
-                    if completed and timed_out:
-                        break
-                    if completed and not timed_out:
-                        # Finished before timeout fired: machine is fast, scale down timeout
-                        t_val = max(0.005, t_val / 4.0)
+        def test_regression_prob_layout_and_literal_paths_long_matches(self):
+            # Exercises both runtime layouts (separate prob arrays on desktop
+            # runtimes, one consolidated buffer on microcontrollers) and both
+            # literal decoders, on data that produces maximum-length matches and
+            # matched literals. The consolidated layout was once 8 entries short,
+            # which only failed on highly repetitive input.
+            lzma = self.lzma
+            if lzma is None:
+                self.skipTest("lzma oracle not available")
+            import os
 
-                self.assertTrue(timed_out, "test must exercise interrupted invocations")
-                self.assertTrue(
-                    completed, "resumption did not converge within attempts"
-                )
-                self.assertEqual(out_f.read_bytes(), raw)
-        finally:
-            if orig_fsync_obj is not None:
-                globals()["_fsync_fileobj"] = orig_fsync_obj
-            if orig_fsync_parent is not None:
-                globals()["_fsync_parent"] = orig_fsync_parent
-
-    def test_regression_checkpoint_resume_convergence_compressed(self):
-        lzma = self.lzma
-        if lzma is None:
-            self.skipTest("lzma oracle not available")
-        import os
-        import tempfile
-        import time
-
-        ram_dir_base = None
-        for cand in ["/dev/shm", "/vfs_ram", "/ramdisk", "/psram"]:
-            if os.path.isdir(cand) and os.access(cand, os.W_OK):
-                ram_dir_base = cand
-                break
-
-        orig_fsync_obj = globals().get("_fsync_fileobj")
-        orig_fsync_parent = globals().get("_fsync_parent")
-        globals()["_fsync_fileobj"] = lambda x: None
-        globals()["_fsync_parent"] = lambda x: None
-
-        def make_input(n):
-            # 6-bit-entropy bytes: real range-decoding work, so decode time
-            # scales with n (pure random data would be stored uncompressed).
-            raw = bytes(b & 0x3F for b in os.urandom(n))
-            return raw, lzma.compress(raw, preset=1)
-
-        def full_run(root, name, xz_data):
-            in_f = root / (name + ".xz")
-            out_f = root / (name + ".bin")
-            in_f.write_bytes(xz_data)
-            t0 = time.time()
-            decompress_xz(
-                str(in_f),
-                str(out_f),
-                timeout=0,
-                cpu_timeout=0,
-                block_size=8192,
-                in_place=True,
-                write_back_cache=1,
+            txt = (
+                bytes(open(__file__, "rb").read()[:60000])
+                if "__file__" in globals()
+                else b"abc" * 5000
             )
-            return time.time() - t0
+            payloads = [
+                bytes(300000),
+                (b"0123456789abcdef" * 20000) + os.urandom(2000) + (b"xyz" * 30000),
+                txt + txt[:20000] + bytes(b & 0x3F for b in os.urandom(30000)),
+            ]
+            saved = (globals()["_IS_DESKTOP_PY"], globals()["_USE_LIT_FN"])
+            try:
+                for desktop in (True, False):
+                    for lit_fn in (True, False):
+                        globals()["_IS_DESKTOP_PY"] = desktop
+                        globals()["_USE_LIT_FN"] = lit_fn
+                        for fmt in (lzma.FORMAT_XZ, lzma.FORMAT_ALONE):
+                            for raw in payloads:
+                                data = lzma.compress(raw, format=fmt, preset=6)
+                                engine = XZStreamDecompressor(io.BytesIO(data))
+                                out = b"".join(
+                                    ev.data
+                                    for ev in engine.decode_events()
+                                    if ev.type == XZEventType.CHUNK_OUTPUT
+                                )
+                                self.assertEqual(
+                                    out,
+                                    raw,
+                                    "desktop=%s lit_fn=%s fmt=%s"
+                                    % (desktop, lit_fn, fmt),
+                                )
+            finally:
+                globals()["_IS_DESKTOP_PY"], globals()["_USE_LIT_FN"] = saved
 
-        # Calibration: grow the input until one uninterrupted decode takes long
-        # enough to be interrupted reliably, then derive the timeout from the
-        # measured time so the test self-adjusts to the machine's speed.
-        min_full = 0.4
-        max_size = 8 * 1024 * 1024
-        try:
-            with tempfile.TemporaryDirectory(
-                prefix="test_ckpt_converge_", dir=ram_dir_base
-            ) as td:
-                root = Path(td)
-                size = 64 * 1024
-                while True:
-                    raw, xz_data = make_input(size)
-                    full = full_run(root, "calib", xz_data)
-                    if full >= min_full or size >= max_size:
-                        break
-                    # aim past min_full in one step when the estimate is usable
-                    grow = int(
-                        size * min(8.0, max(2.0, 1.5 * min_full / max(full, 1e-4)))
-                    )
-                    size = min(max_size, grow)
-                if full < 0.1:
-                    self.skipTest(
-                        "decoder too fast to exercise interruption at max test size"
-                    )
-                # ~1/5 of an uninterrupted run => several forced interruptions
-                tmo = max(0.02, full / 5.0)
+        def test_regression_concatenated_stream_flavors(self):
+            # xz+xz, xz+lzma, lzma+xz and lzma+lzma (and three-stream mixes), from
+            # both seekable and non-seekable input.
+            lzma = self.lzma
+            if lzma is None:
+                self.skipTest("lzma oracle not available")
+            import itertools
 
-                in_f = root / "input.xz"
-                out_f = root / "output.bin"
-                r_dir = root / "resume"
-                in_f.write_bytes(xz_data)
-                timed_out = 0
-                completed = False
-                max_attempts = 200
-                for _attempt in range(max_attempts):
-                    try:
-                        decompress_xz(
-                            str(in_f),
-                            str(out_f),
-                            resume_dir=str(r_dir),
-                            resume_mode="auto",
-                            timeout=tmo,
-                            cpu_timeout=tmo,
-                            block_size=8192,
-                            checkpoint_interval="16k",
-                            in_place=True,
-                            write_back_cache=1,
-                        )
-                        completed = True
-                        break
-                    except (WallClockTimeout, CPUTimeout):
-                        timed_out += 1
-                self.assertTrue(
-                    timed_out > 0,
-                    "test must exercise interrupted invocations "
-                    "(full run %.3fs, timeout %.3fs)" % (full, tmo),
-                )
-                self.assertTrue(
-                    completed,
-                    "resumption did not converge within %d attempts "
-                    "(timeout %.3fs, %d interruptions)"
-                    % (max_attempts, tmo, timed_out),
-                )
-                self.assertEqual(out_f.read_bytes(), raw)
-        finally:
-            if orig_fsync_obj is not None:
-                globals()["_fsync_fileobj"] = orig_fsync_obj
-            if orig_fsync_parent is not None:
-                globals()["_fsync_parent"] = orig_fsync_parent
+            parts = [b"first stream " * 400, bytes(range(256)) * 30, b"third " * 900]
 
-    def test_regression_prob_layout_and_literal_paths_long_matches(self):
-        # Exercises both runtime layouts (separate prob arrays on desktop
-        # runtimes, one consolidated buffer on microcontrollers) and both
-        # literal decoders, on data that produces maximum-length matches and
-        # matched literals. The consolidated layout was once 8 entries short,
-        # which only failed on highly repetitive input.
-        lzma = self.lzma
-        if lzma is None:
-            self.skipTest("lzma oracle not available")
-        import os
+            class Pipe(getattr(io, "RawIOBase", object)):
+                def __init__(self, raw_bytes):
+                    self.buf = io.BytesIO(raw_bytes)
 
-        txt = (
-            bytes(open(__file__, "rb").read()[:60000])
-            if "__file__" in globals()
-            else b"abc" * 5000
-        )
-        payloads = [
-            bytes(300000),
-            (b"0123456789abcdef" * 20000) + os.urandom(2000) + (b"xyz" * 30000),
-            txt + txt[:20000] + bytes(b & 0x3F for b in os.urandom(30000)),
-        ]
-        saved = (globals()["_IS_DESKTOP_PY"], globals()["_USE_LIT_FN"])
-        try:
-            for desktop in (True, False):
-                for lit_fn in (True, False):
-                    globals()["_IS_DESKTOP_PY"] = desktop
-                    globals()["_USE_LIT_FN"] = lit_fn
-                    for fmt in (lzma.FORMAT_XZ, lzma.FORMAT_ALONE):
-                        for raw in payloads:
-                            data = lzma.compress(raw, format=fmt, preset=6)
-                            engine = XZStreamDecompressor(io.BytesIO(data))
-                            out = b"".join(
-                                ev.data
-                                for ev in engine.decode_events()
-                                if ev.type == XZEventType.CHUNK_OUTPUT
-                            )
-                            self.assertEqual(
-                                out,
-                                raw,
-                                "desktop=%s lit_fn=%s fmt=%s" % (desktop, lit_fn, fmt),
-                            )
-        finally:
-            globals()["_IS_DESKTOP_PY"], globals()["_USE_LIT_FN"] = saved
+                def read(self, n=-1):
+                    return self.buf.read(n)
 
-    def test_regression_concatenated_stream_flavors(self):
-        # xz+xz, xz+lzma, lzma+xz and lzma+lzma (and three-stream mixes), from
-        # both seekable and non-seekable input.
-        lzma = self.lzma
-        if lzma is None:
-            self.skipTest("lzma oracle not available")
-        import itertools
+                def readable(self):
+                    return True
 
-        parts = [b"first stream " * 400, bytes(range(256)) * 30, b"third " * 900]
+                def seekable(self):
+                    return False
 
-        class Pipe(io.RawIOBase):
-            def __init__(self, raw_bytes):
-                self.buf = io.BytesIO(raw_bytes)
+            def comp(kind, raw):
+                fmt = lzma.FORMAT_XZ if kind == "xz" else lzma.FORMAT_ALONE
+                return lzma.compress(raw, format=fmt)
 
-            def read(self, n=-1):
-                return self.buf.read(n)
-
-            def readable(self):
-                return True
-
-            def seekable(self):
-                return False
-
-        def comp(kind, raw):
-            fmt = lzma.FORMAT_XZ if kind == "xz" else lzma.FORMAT_ALONE
-            return lzma.compress(raw, format=fmt)
-
-        for n in (2, 3):
-            for kinds in itertools.product(("xz", "lzma"), repeat=n):
-                data = b"".join(comp(k, p) for k, p in zip(kinds, parts))
-                for source in (io.BytesIO(data), Pipe(data)):
-                    engine = XZStreamDecompressor(source)
-                    outs, cur = [], []
-                    for ev in engine.decode_events():
-                        if ev.type == XZEventType.CHUNK_OUTPUT:
-                            cur.append(bytes(ev.data))
-                        elif ev.type == XZEventType.STREAM_BOUNDARY:
+            for n in (2, 3):
+                for kinds in itertools.product(("xz", "lzma"), repeat=n):
+                    data = b"".join(comp(k, p) for k, p in zip(kinds, parts))
+                    for source in (io.BytesIO(data), Pipe(data)):
+                        engine = XZStreamDecompressor(source)
+                        outs, cur = [], []
+                        for ev in engine.decode_events():
+                            if ev.type == XZEventType.CHUNK_OUTPUT:
+                                cur.append(bytes(ev.data))
+                            elif ev.type == XZEventType.STREAM_BOUNDARY:
+                                outs.append(b"".join(cur))
+                                cur = []
+                        if cur:
                             outs.append(b"".join(cur))
-                            cur = []
-                    if cur:
-                        outs.append(b"".join(cur))
-                    self.assertEqual(
-                        b"".join(outs),
-                        b"".join(parts[:n]),
-                        "kinds=%s seekable=%s" % (kinds, source.seekable()),
-                    )
+                        self.assertEqual(
+                            b"".join(outs),
+                            b"".join(parts[:n]),
+                            "kinds=%s seekable=%s" % (kinds, source.seekable()),
+                        )
 
-    def test_regression_core_prob_arrays_reset_between_streams(self):
-        # _reinit_probs() must reach the arrays the decoder actually uses, in
-        # both the separate-array and the consolidated-buffer layouts.
-        saved = globals()["_IS_DESKTOP_PY"]
-        try:
-            for desktop in (True, False):
-                globals()["_IS_DESKTOP_PY"] = desktop
-                engine = XZStreamDecompressor(io.BytesIO(b""))
-                for arr in engine._core_prob_arrays():
-                    arr[0] = 7
-                    arr[len(arr) - 1] = 9
-                engine._reinit_probs()
-                for arr in engine._core_prob_arrays():
-                    self.assertEqual(arr[0], 1024, "desktop=%s" % desktop)
-                    self.assertEqual(arr[len(arr) - 1], 1024, "desktop=%s" % desktop)
-        finally:
-            globals()["_IS_DESKTOP_PY"] = saved
+        def test_regression_core_prob_arrays_reset_between_streams(self):
+            # _reinit_probs() must reach the arrays the decoder actually uses, in
+            # both the separate-array and the consolidated-buffer layouts.
+            saved = globals()["_IS_DESKTOP_PY"]
+            try:
+                for desktop in (True, False):
+                    globals()["_IS_DESKTOP_PY"] = desktop
+                    engine = XZStreamDecompressor(io.BytesIO(b""))
+                    for arr in engine._core_prob_arrays():
+                        arr[0] = 7
+                        arr[len(arr) - 1] = 9
+                    engine._reinit_probs()
+                    for arr in engine._core_prob_arrays():
+                        self.assertEqual(arr[0], 1024, "desktop=%s" % desktop)
+                        self.assertEqual(
+                            arr[len(arr) - 1], 1024, "desktop=%s" % desktop
+                        )
+            finally:
+                globals()["_IS_DESKTOP_PY"] = saved
 
-    def test_regression_malformed_lzma2_and_properties(self):
-        lzma = self.lzma
-        if lzma is None:
-            self.skipTest("lzma oracle not available")
-        import io, struct
+        def test_regression_malformed_lzma2_and_properties(self):
+            lzma = self.lzma
+            if lzma is None:
+                self.skipTest("lzma oracle not available")
+            import io, struct
 
-        data = b"MALFORMED_VALIDATION_TEST" * 10
-        good_xz = bytearray(lzma.compress(data, check=lzma.CHECK_CRC32))
+            data = b"MALFORMED_VALIDATION_TEST" * 10
+            good_xz = bytearray(lzma.compress(data, check=lzma.CHECK_CRC32))
 
-        # 1. Block header dict prop = 0x40 (> 40)
-        bad_prop_xz = bytearray(good_xz)
-        bad_prop_xz[16] = 0x40
-        h_sz = (bad_prop_xz[12] + 1) * 4
-        bad_prop_xz[12 + h_sz - 4 : 12 + h_sz] = struct.pack(
-            "<I", crc32(bad_prop_xz[12 : 12 + h_sz - 4])
-        )
-        with self.assertRaises(XZFormatError):
-            engine = XZStreamDecompressor(io.BytesIO(bytes(bad_prop_xz)))
-            list(engine.decode_events())
-
-        # 2. First chunk ctrl byte = 0x02 (uncompressed without dict reset)
-        h_end = 12 + h_sz
-        if bad_prop_xz[h_end] in (0x01, 0x02):
-            bad_ctrl_xz = bytearray(good_xz)
-            bad_ctrl_xz[h_end] = 0x02
+            # 1. Block header dict prop = 0x40 (> 40)
+            bad_prop_xz = bytearray(good_xz)
+            bad_prop_xz[16] = 0x40
+            h_sz = (bad_prop_xz[12] + 1) * 4
+            bad_prop_xz[12 + h_sz - 4 : 12 + h_sz] = struct.pack(
+                "<I", crc32(bad_prop_xz[12 : 12 + h_sz - 4])
+            )
             with self.assertRaises(XZFormatError):
-                engine = XZStreamDecompressor(io.BytesIO(bytes(bad_ctrl_xz)))
+                engine = XZStreamDecompressor(io.BytesIO(bytes(bad_prop_xz)))
                 list(engine.decode_events())
 
-    def test_regression_preflight_disk_space_check(self):
-        lzma = self.lzma
-        import io
+            # 2. First chunk ctrl byte = 0x02 (uncompressed without dict reset)
+            h_end = 12 + h_sz
+            if bad_prop_xz[h_end] in (0x01, 0x02):
+                bad_ctrl_xz = bytearray(good_xz)
+                bad_ctrl_xz[h_end] = 0x02
+                with self.assertRaises(XZFormatError):
+                    engine = XZStreamDecompressor(io.BytesIO(bytes(bad_ctrl_xz)))
+                    list(engine.decode_events())
 
-        raw = b"SPACE_PREFLIGHT_TEST_PAYLOAD_" * 1000
-        xz_data = lzma.compress(raw, preset=1)
-        out_f = Path("/tmp/test_space_check_out.bin")
-        out_f.unlink(missing_ok=True)
+        def test_regression_preflight_disk_space_check(self):
+            lzma = self.lzma
+            import io
 
-        real_get_disk_info = globals()["get_disk_info"]
-        globals()["get_disk_info"] = lambda p: (500, "/mock/mount", Path("/mock/mount"))
-        try:
-            # 1. Should fail with XZResourceError without --ignore-space-check
-            with self.assertRaises(XZResourceError):
-                decompress_xz(io.BytesIO(xz_data), str(out_f), ignore_space_check=False)
-            self.assertFalse(out_f.exists())
-
-            # 2. Should succeed with warning when ignore_space_check=True
-            decompress_xz(io.BytesIO(xz_data), str(out_f), ignore_space_check=True)
-            self.assertTrue(out_f.exists())
-            self.assertEqual(out_f.read_bytes(), raw)
+            raw = b"SPACE_PREFLIGHT_TEST_PAYLOAD_" * 1000
+            xz_data = lzma.compress(raw, preset=1)
+            out_f = Path("/tmp/test_space_check_out.bin")
             out_f.unlink(missing_ok=True)
-        finally:
-            globals()["get_disk_info"] = real_get_disk_info
 
-    def test_regression_micropython_urandom_getrandbits_limit(self):
-        # MicroPython urandom.getrandbits raises ValueError if bits > 32
-        class Strict32BitUrandom:
-            @staticmethod
-            def getrandbits(k):
-                if k > 32:
-                    raise ValueError("bits must be 32 or less")
-                return 0x12345678
-
-        import sys
-
-        sys.modules["urandom"] = Strict32BitUrandom
-        try:
-            sid = _generate_stream_id()
-            self.assertEqual(len(sid), 16)
-            self.assertEqual(sid, "1234567812345678")
-        finally:
-            sys.modules.pop("urandom", None)
-
-    def test_regression_micropython_os_atomic_replace(self):
-        global os
-        real_os = os
-
-        class MockMicroPythonOS:
-            def __init__(self, real):
-                self._real = real
-
-            def __getattr__(self, name):
-                if name in ("replace", "path", "access", "W_OK"):
-                    raise AttributeError(f"module 'os' has no attribute '{name}'")
-                return getattr(self._real, name)
-
-        os = MockMicroPythonOS(real_os)
-        try:
-            s = Path("/tmp/test_mpy_atomic_src.txt")
-            d = Path("/tmp/test_mpy_atomic_dst.txt")
-            s.write_text("mpy_data")
-            d.unlink(missing_ok=True)
-            atomic_replace(s, d)
-            self.assertTrue(d.exists())
-            self.assertEqual(d.read_text(), "mpy_data")
-            self.assertFalse(s.exists())
-
-            # Test replace when dst already exists
-            s.write_text("mpy_data_v2")
-            atomic_replace(s, d)
-            self.assertTrue(d.exists())
-            self.assertEqual(d.read_text(), "mpy_data_v2")
-            self.assertFalse(s.exists())
-            d.unlink(missing_ok=True)
-        finally:
-            os = real_os
-
-    def test_bug1_pb4_length_coding_roundtrip(self):
-        lzma = self.lzma
-        import io
-
-        pat = b"pb4_length_coding_pattern_abcdefghijklmno"
-        data = pat + b"1234567890" * 8
-        while len(data) % 16 != 10:
-            data += b"z"
-        data = data + pat * 3 + b"_end_marker"
-
-        # Pre-compressed LZMA2 (XZ) fixtures for runtimes whose lzma compressor lacks custom filters (e.g. PyPy3)
-        xz_fixtures = {
-            (0, 0, 4): bytes.fromhex(
-                "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff0049b4003818c4d3c0d331776563f1e86288a8d13ff925bf6d0570034f06d146aed5021cde028b7e02a95235dee5296781f0fccbf23357275ea07bae67377997eeb91755d6a3725a4626bd02d00000000031d6a6ab1ded214500016580020000002d328380b1c467fb020000000004595a"
-            ),
-            (4, 0, 4): bytes.fromhex(
-                "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff004cb80038188285f361a504a50b391e0c24e529ad31aa76a6f0cdad64e00e9c25e615a538134759a493d58d5c766f5eba982098a0db3f36be374282499d2a3112bce2f586968f9dcf40f04f7ecc2a000031d6a6ab1ded21450001688002000000f3211d3cb1c467fb020000000004595a"
-            ),
-            (0, 4, 4): bytes.fromhex(
-                "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff0051d80038188285f36194dc673a1a0be6337990d300c17ce86c3662eec15de7dd766a830c351bee0d77b5610bd54e7fff26913544cc5fc0ee009e1f664a13b06242d59b65a800026f899ffe1eac986216cef1b9000000000031d6a6ab1ded214500016d800200000040b0d06cb1c467fb020000000004595a"
-            ),
-            (2, 2, 4): bytes.fromhex(
-                "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff004ec80038188285f3619c64a58736670f26372e1bdb821f487bdd572e7976fe6eb4823396b6721045c804a6bf78db8edd930ef67bd8fb369e30eddf962d897f95590d1168e722f6cc272c2ee78ba5b2531a00000031d6a6ab1ded214500016a8002000000f880d571b1c467fb020000000004595a"
-            ),
-        }
-
-        # Pre-compressed LZMA1 fixtures for runtimes whose lzma compressor lacks custom ALONE filters (e.g. PyPy3)
-        lzma_fixtures = {
-            (0, 0, 4): bytes.fromhex(
-                "b400001000ffffffffffffffff003818c4d3c0d331776563f1e86288a8d13ff925bf6d05700361231828c7907663aa409c71863342ee8e66a00f8265a1f12d009c14656a2f2d8f465ef73c635e62a886b28bdc3c32b8fff1ce3000"
-            ),
-            (4, 0, 4): bytes.fromhex(
-                "b800001000ffffffffffffffff0038188285f361a504a50b391e0c24e529ad31aa76a6f0cdad64e2bf5de5e59b101d69b2e00a613c26a31892e57f057f660edb69b58adf81acf1149d9a62bcf74b9882faab56983898db411fffeeeaa000"
-            ),
-            (0, 4, 4): bytes.fromhex(
-                "d800001000ffffffffffffffff0038188285f36194dc673a1a0be6337990d300c17ce86c3662eec16b61a845437216aaea3e375bbdf1617b18604d5812571b84dd81c35a77f0ae8c7018b41e0a4e7ea81adc78ed5db33f84b7b6bcd8da0effff294b8000"
-            ),
-            (2, 2, 4): bytes.fromhex(
-                "c800001000ffffffffffffffff0038188285f3619c64a58736670f26372e1bdb821f487bdd572e79fd5ebe97cfa114ef1fead2e265dd0cf7ceca90e8a26c4004b88081933071b865c879777c97b7343ba144d9c51fbaf4b6b5d93373ffe1cea000"
-            ),
-        }
-
-        combos = [(0, 0, 4), (4, 0, 4), (0, 4, 4), (2, 2, 4)]
-        for lc, lp, pb in combos:
-            # Test XZ (LZMA2) - Include preset: 0 and fallback to xz_fixtures on PyPy3
-            c_xz = None
+            real_get_disk_info = globals()["get_disk_info"]
+            globals()["get_disk_info"] = lambda p: (
+                500,
+                "/mock/mount",
+                Path("/mock/mount"),
+            )
             try:
-                f_xz = [
-                    {
-                        "id": lzma.FILTER_LZMA2,
-                        "preset": 0,
-                        "lc": lc,
-                        "lp": lp,
-                        "pb": pb,
-                        "dict_size": 1048576,
-                    }
-                ]
-                c_xz = lzma.compress(data, format=lzma.FORMAT_XZ, filters=f_xz)
-            except (NotImplementedError, lzma.LZMAError, Exception):
-                c_xz = xz_fixtures.get((lc, lp, pb))
+                # 1. Should fail with XZResourceError without --ignore-space-check
+                with self.assertRaises(XZResourceError):
+                    self.decompress_xz(
+                        io.BytesIO(xz_data), str(out_f), ignore_space_check=False
+                    )
+                self.assertFalse(out_f.exists())
 
-            eng_xz = XZStreamDecompressor(io.BytesIO(c_xz))
-            out_xz = b"".join(
-                ev.data
-                for ev in eng_xz.decode_events()
-                if ev.type == XZEventType.CHUNK_OUTPUT
-            )
-            self.assertEqual(
-                out_xz, data, f"Failed XZ pb=4 with lc={lc}, lp={lp}, pb={pb}"
-            )
-
-            # Test LZMA Alone (LZMA1) - PyPy3 does not implement custom LZMA1 filters
-            c_lzma = None
-            try:
-                f_lzma = [
-                    {
-                        "id": lzma.FILTER_LZMA1,
-                        "preset": 0,
-                        "lc": lc,
-                        "lp": lp,
-                        "pb": pb,
-                        "dict_size": 1048576,
-                    }
-                ]
-                c_lzma = lzma.compress(data, format=lzma.FORMAT_ALONE, filters=f_lzma)
-            except (NotImplementedError, lzma.LZMAError, Exception):
-                c_lzma = lzma_fixtures.get((lc, lp, pb))
-
-            eng_lzma = XZStreamDecompressor(io.BytesIO(c_lzma))
-            out_lzma = b"".join(
-                ev.data
-                for ev in eng_lzma.decode_events()
-                if ev.type == XZEventType.CHUNK_OUTPUT
-            )
-            self.assertEqual(
-                out_lzma, data, f"Failed LZMA pb=4 with lc={lc}, lp={lp}, pb={pb}"
-            )
-
-    def test_bug2_legacy_lzma_eof_truncation_detection(self):
-        lzma = self.lzma
-        import io, struct
-
-        raw = b"TRUNCATION_TEST_PAYLOAD_STRING_" * 20
-
-        # Case A: Known uncompressed size header rewritten
-        comp_known = bytearray(lzma.compress(raw, format=lzma.FORMAT_ALONE))
-        comp_known[5:13] = struct.pack("<Q", len(raw))
-
-        for cut in [1, 5, 15, len(comp_known) // 2]:
-            trunc = bytes(comp_known[:-cut])
-            with self.assertRaises((XZFormatError, EOFError)):
-                eng = XZStreamDecompressor(io.BytesIO(trunc))
-                list(eng.decode_events())
-
-        # Case B: Unknown uncompressed size (EOS marker) truncated
-        comp_eos = lzma.compress(raw, format=lzma.FORMAT_ALONE)
-        for cut in [2, 6, 12]:
-            trunc_eos = comp_eos[:-cut]
-            with self.assertRaises((XZFormatError, EOFError)):
-                eng = XZStreamDecompressor(io.BytesIO(trunc_eos))
-                list(eng.decode_events())
-
-    def test_bug3_legacy_lzma_trailing_bytes_rejection(self):
-        lzma = self.lzma
-        import io
-
-        raw = b"TRAILING_TEST_PAYLOAD_" * 15
-        comp = lzma.compress(raw, format=lzma.FORMAT_ALONE)
-
-        # Trailing random garbage
-        with self.assertRaises(XZFormatError):
-            eng = XZStreamDecompressor(io.BytesIO(comp + b"TRAILING_GARBAGE"))
-            list(eng.decode_events())
-
-        # Four trailing zeros (unsupported after LZMA alone)
-        with self.assertRaises(XZFormatError):
-            eng = XZStreamDecompressor(io.BytesIO(comp + b"\x00\x00\x00\x00"))
-            list(eng.decode_events())
-
-    def test_bug4_legacy_lzma_props_zero(self):
-        lzma = self.lzma
-        import io
-
-        raw = b"PROPS_ZERO_TEST_PAYLOAD_" * 25
-        static_comp = bytes.fromhex(
-            "0000001000ffffffffffffffff0028158a671bda02e192937e9742b55c540136da778c385be7d7c9db61e744f5f66ffff930c400"
-        )
-        try:
-            filters = [
-                {
-                    "id": lzma.FILTER_LZMA1,
-                    "preset": 0,
-                    "lc": 0,
-                    "lp": 0,
-                    "pb": 0,
-                    "dict_size": 1048576,
-                }
-            ]
-            comp = lzma.compress(raw, format=lzma.FORMAT_ALONE, filters=filters)
-        except (NotImplementedError, Exception):
-            comp = static_comp
-
-        self.assertEqual(comp[0], 0x00)
-
-        eng = XZStreamDecompressor(io.BytesIO(comp))
-        out = b"".join(
-            ev.data for ev in eng.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out, raw)
-
-    def test_bug5_strict_format_detection_and_empty_input(self):
-        import io
-
-        # 1. Text string starting with <= 224 but invalid dict size
-        with self.assertRaises(XZFormatError):
-            eng = XZStreamDecompressor(io.BytesIO(b"notxz" * 10))
-            list(eng.decode_events())
-
-        # 2. Random garbage input
-        with self.assertRaises(XZFormatError):
-            eng = XZStreamDecompressor(
-                io.BytesIO(b"\x5d\x12\x34\x56\x78\x9a\xbc\xde\xf0\x11\x22\x33\x44")
-            )
-            list(eng.decode_events())
-
-        # 3. Completely empty input (0 bytes) must fail with XZFormatError (exit 1)
-        with self.assertRaises(XZFormatError):
-            eng = XZStreamDecompressor(io.BytesIO(b""))
-            list(eng.decode_events())
-
-    def test_lzma_9e_postage_stamp_microcontroller_512b_blocks(self):
-        # Even on postage stamp microcontrollers, decompress lzma -9e bit-perfectly with 512B blocks
-        lzma = self.lzma
-        import io, random
-
-        prng = random.Random(1337)
-        raw = bytearray()
-        for _ in range(25):
-            raw.extend(prng.randbytes(500))
-            raw.extend(b"EXTREME_LZMA9E_POSTAGE_STAMP_PATTERN_512B_" * 20)
-            raw.extend(prng.randbytes(300))
-        raw = bytes(raw)
-        c_9e = lzma.compress(raw, preset=9 | lzma.PRESET_EXTREME)
-
-        # Decompress using 512B blocks and 512B RAM history budget
-        vfs = MemoryStorage()
-        hist = UnifiedHistory(storage_driver=vfs, ram_cache_bytes=512, block_size=512)
-        engine = XZStreamDecompressor(
-            io.BytesIO(c_9e), history_backend=hist, block_size=512
-        )
-        out = bytearray()
-        for ev in engine.decode_events():
-            if ev.type == XZEventType.CHUNK_OUTPUT:
-                out.extend(ev.data)
-                self.assertLessEqual(len(ev.data), 512)
-        self.assertEqual(bytes(out), raw)
-
-    def test_allowed_block_size_enforcement(self):
-        # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 512 KiB RAM), 65536 bytes otherwise
-        self.assertEqual(select_block_size("auto", available_mem=32 * 1024), 512)
-        self.assertEqual(select_block_size("auto", available_mem=64 * 1024), 512)
-        self.assertEqual(select_block_size("auto", available_mem=95 * 1024), 512)
-        self.assertEqual(select_block_size("auto", available_mem=96 * 1024), 8192)
-        self.assertEqual(select_block_size("auto", available_mem=511 * 1024), 8192)
-        self.assertEqual(select_block_size("auto", available_mem=512 * 1024), 65536)
-        self.assertEqual(
-            select_block_size("auto", available_mem=16 * 1024 * 1024), 65536
-        )
-
-        # Explicit overrides: only 512, 8192, 65536
-        self.assertEqual(select_block_size(512), 512)
-        self.assertEqual(select_block_size("512"), 512)
-        self.assertEqual(select_block_size("8k"), 8192)
-        self.assertEqual(select_block_size(8192), 8192)
-        self.assertEqual(select_block_size("64k"), 65536)
-        self.assertEqual(select_block_size(65536), 65536)
-
-        # Disallowed sizes raise XZFormatError
-        for bad_sz in [256, 1024, 2048, 4096, 16384, 32768, 131072, "4k", "16k"]:
-            with self.assertRaises(XZFormatError):
-                select_block_size(bad_sz)
-
-    def test_no_closure_creation_in_decode_loop(self):
-        # RangeDecoder pre-allocated and reused without closure creation
-        lzma = self.lzma
-        import io
-
-        raw = b"NO_CLOSURES_ALLOWED_IN_DECODE_LOOP_" * 50
-        xz_data = lzma.compress(raw, preset=1)
-        eng = XZStreamDecompressor(io.BytesIO(xz_data), block_size=512)
-        blk, eof = eng.decode_block()
-        self.assertGreater(len(blk), 0)
-        self.assertIsNotNone(eng.rd)
-
-    def test_crc64_pure_ram_determination(self):
-        self.assertEqual(crc64(b"123456789"), 0x995DC9BBDF1939FA)
-
-    def test_inbuf_hbuf_external_sharing(self):
-        vfs = MemoryStorage()
-        hist = UnifiedHistory(storage_driver=vfs, ram_cache_bytes=512, block_size=512)
-        hist.append_block(b"S" * 512)
-        self.assertEqual(hist.blocks_len, 512)
-
-    def test_concatenation_all_four_flavors_and_padding(self):
-        # Comprehensive validation of all 4 concatenation flavors (xz+xz, xz+lzma, lzma+xz, lzma+lzma)
-        lzma = self.lzma
-        import io
-
-        class NonSeekPipe(io.RawIOBase):
-            def __init__(self, raw_bytes):
-                self.buf = io.BytesIO(raw_bytes)
-
-            def read(self, n=-1):
-                return self.buf.read(n)
-
-            def readable(self):
-                return True
-
-            def seekable(self):
-                return False
-
-        s1 = b"STREAM_FIRST_CONTENT_ABCDEF_" * 35
-        s2 = b"STREAM_SECOND_CONTENT_GHIJKL_" * 35
-        c_xz1 = lzma.compress(s1, format=lzma.FORMAT_XZ)
-        c_xz2 = lzma.compress(s2, format=lzma.FORMAT_XZ)
-        c_lzma1 = lzma.compress(s1, format=lzma.FORMAT_ALONE)
-        c_lzma2 = lzma.compress(s2, format=lzma.FORMAT_ALONE)
-
-        pairs = [
-            ("xz+xz", c_xz1, c_xz2),
-            ("xz+lzma", c_xz1, c_lzma2),
-            ("lzma+xz", c_lzma1, c_xz2),
-            ("lzma+lzma", c_lzma1, c_lzma2),
-        ]
-        for name, c1, c2 in pairs:
-            for pad in [0, 4, 8]:
-                combined = c1 + (b"\x00" * pad) + c2
-                # Seekable stream
-                eng_seek = XZStreamDecompressor(io.BytesIO(combined))
-                out_seek = b"".join(
-                    ev.data
-                    for ev in eng_seek.decode_events()
-                    if ev.type == XZEventType.CHUNK_OUTPUT
+                # 2. Should succeed with warning when ignore_space_check=True
+                self.decompress_xz(
+                    io.BytesIO(xz_data), str(out_f), ignore_space_check=True
                 )
-                self.assertEqual(out_seek, s1 + s2, f"Failed seekable {name} pad={pad}")
+                self.assertTrue(out_f.exists())
+                self.assertEqual(out_f.read_bytes(), raw)
+                out_f.unlink(missing_ok=True)
+            finally:
+                globals()["get_disk_info"] = real_get_disk_info
 
-                # Unseekable pipe stream
-                eng_pipe = XZStreamDecompressor(NonSeekPipe(combined))
-                out_pipe = b"".join(
+        def test_regression_micropython_urandom_getrandbits_limit(self):
+            # MicroPython urandom.getrandbits raises ValueError if bits > 32
+            class Strict32BitUrandom:
+                @staticmethod
+                def getrandbits(k):
+                    if k > 32:
+                        raise ValueError("bits must be 32 or less")
+                    return 0x12345678
+
+            import sys
+
+            sys.modules["urandom"] = Strict32BitUrandom
+            try:
+                sid = _generate_stream_id()
+                self.assertEqual(len(sid), 16)
+                self.assertEqual(sid, "1234567812345678")
+            finally:
+                sys.modules.pop("urandom", None)
+
+        def test_regression_micropython_os_atomic_replace(self):
+            global os
+            real_os = os
+
+            class MockMicroPythonOS:
+                def __init__(self, real):
+                    self._real = real
+
+                def __getattr__(self, name):
+                    if name in ("replace", "path", "access", "W_OK"):
+                        raise AttributeError(f"module 'os' has no attribute '{name}'")
+                    return getattr(self._real, name)
+
+            os = MockMicroPythonOS(real_os)
+            try:
+                s = Path("/tmp/test_mpy_atomic_src.txt")
+                d = Path("/tmp/test_mpy_atomic_dst.txt")
+                s.write_text("mpy_data")
+                d.unlink(missing_ok=True)
+                atomic_replace(s, d)
+                self.assertTrue(d.exists())
+                self.assertEqual(d.read_text(), "mpy_data")
+                self.assertFalse(s.exists())
+
+                # Test replace when dst already exists
+                s.write_text("mpy_data_v2")
+                atomic_replace(s, d)
+                self.assertTrue(d.exists())
+                self.assertEqual(d.read_text(), "mpy_data_v2")
+                self.assertFalse(s.exists())
+                d.unlink(missing_ok=True)
+            finally:
+                os = real_os
+
+        def test_bug1_pb4_length_coding_roundtrip(self):
+            lzma = self.lzma
+            import io
+
+            pat = b"pb4_length_coding_pattern_abcdefghijklmno"
+            data = pat + b"1234567890" * 8
+            while len(data) % 16 != 10:
+                data += b"z"
+            data = data + pat * 3 + b"_end_marker"
+
+            # Pre-compressed LZMA2 (XZ) fixtures for runtimes whose lzma compressor lacks custom filters (e.g. PyPy3)
+            xz_fixtures = {
+                (0, 0, 4): bytes.fromhex(
+                    "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff0049b4003818c4d3c0d331776563f1e86288a8d13ff925bf6d0570034f06d146aed5021cde028b7e02a95235dee5296781f0fccbf23357275ea07bae67377997eeb91755d6a3725a4626bd02d00000000031d6a6ab1ded214500016580020000002d328380b1c467fb020000000004595a"
+                ),
+                (4, 0, 4): bytes.fromhex(
+                    "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff004cb80038188285f361a504a50b391e0c24e529ad31aa76a6f0cdad64e00e9c25e615a538134759a493d58d5c766f5eba982098a0db3f36be374282499d2a3112bce2f586968f9dcf40f04f7ecc2a000031d6a6ab1ded21450001688002000000f3211d3cb1c467fb020000000004595a"
+                ),
+                (0, 4, 4): bytes.fromhex(
+                    "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff0051d80038188285f36194dc673a1a0be6337990d300c17ce86c3662eec15de7dd766a830c351bee0d77b5610bd54e7fff26913544cc5fc0ee009e1f664a13b06242d59b65a800026f899ffe1eac986216cef1b9000000000031d6a6ab1ded214500016d800200000040b0d06cb1c467fb020000000004595a"
+                ),
+                (2, 2, 4): bytes.fromhex(
+                    "fd377a585a000004e6d6b4460200210110000000a8708e86e000ff004ec80038188285f3619c64a58736670f26372e1bdb821f487bdd572e7976fe6eb4823396b6721045c804a6bf78db8edd930ef67bd8fb369e30eddf962d897f95590d1168e722f6cc272c2ee78ba5b2531a00000031d6a6ab1ded214500016a8002000000f880d571b1c467fb020000000004595a"
+                ),
+            }
+
+            # Pre-compressed LZMA1 fixtures for runtimes whose lzma compressor lacks custom ALONE filters (e.g. PyPy3)
+            lzma_fixtures = {
+                (0, 0, 4): bytes.fromhex(
+                    "b400001000ffffffffffffffff003818c4d3c0d331776563f1e86288a8d13ff925bf6d05700361231828c7907663aa409c71863342ee8e66a00f8265a1f12d009c14656a2f2d8f465ef73c635e62a886b28bdc3c32b8fff1ce3000"
+                ),
+                (4, 0, 4): bytes.fromhex(
+                    "b800001000ffffffffffffffff0038188285f361a504a50b391e0c24e529ad31aa76a6f0cdad64e2bf5de5e59b101d69b2e00a613c26a31892e57f057f660edb69b58adf81acf1149d9a62bcf74b9882faab56983898db411fffeeeaa000"
+                ),
+                (0, 4, 4): bytes.fromhex(
+                    "d800001000ffffffffffffffff0038188285f36194dc673a1a0be6337990d300c17ce86c3662eec16b61a845437216aaea3e375bbdf1617b18604d5812571b84dd81c35a77f0ae8c7018b41e0a4e7ea81adc78ed5db33f84b7b6bcd8da0effff294b8000"
+                ),
+                (2, 2, 4): bytes.fromhex(
+                    "c800001000ffffffffffffffff0038188285f3619c64a58736670f26372e1bdb821f487bdd572e79fd5ebe97cfa114ef1fead2e265dd0cf7ceca90e8a26c4004b88081933071b865c879777c97b7343ba144d9c51fbaf4b6b5d93373ffe1cea000"
+                ),
+            }
+
+            combos = [(0, 0, 4), (4, 0, 4), (0, 4, 4), (2, 2, 4)]
+            for lc, lp, pb in combos:
+                # Test XZ (LZMA2) - Include preset: 0 and fallback to xz_fixtures on PyPy3
+                c_xz = None
+                try:
+                    f_xz = [
+                        {
+                            "id": lzma.FILTER_LZMA2,
+                            "preset": 0,
+                            "lc": lc,
+                            "lp": lp,
+                            "pb": pb,
+                            "dict_size": 1048576,
+                        }
+                    ]
+                    c_xz = lzma.compress(data, format=lzma.FORMAT_XZ, filters=f_xz)
+                except (NotImplementedError, lzma.LZMAError, Exception):
+                    c_xz = xz_fixtures.get((lc, lp, pb))
+
+                eng_xz = XZStreamDecompressor(io.BytesIO(c_xz))
+                out_xz = b"".join(
                     ev.data
-                    for ev in eng_pipe.decode_events()
+                    for ev in eng_xz.decode_events()
                     if ev.type == XZEventType.CHUNK_OUTPUT
                 )
                 self.assertEqual(
-                    out_pipe, s1 + s2, f"Failed unseekable {name} pad={pad}"
+                    out_xz, data, f"Failed XZ pb=4 with lc={lc}, lp={lp}, pb={pb}"
                 )
 
-    def test_concatenated_intermixed_lzma_xz_streams(self):
-        lzma = self.lzma
-        import io
+                # Test LZMA Alone (LZMA1) - PyPy3 does not implement custom LZMA1 filters
+                c_lzma = None
+                try:
+                    f_lzma = [
+                        {
+                            "id": lzma.FILTER_LZMA1,
+                            "preset": 0,
+                            "lc": lc,
+                            "lp": lp,
+                            "pb": pb,
+                            "dict_size": 1048576,
+                        }
+                    ]
+                    c_lzma = lzma.compress(
+                        data, format=lzma.FORMAT_ALONE, filters=f_lzma
+                    )
+                except (NotImplementedError, lzma.LZMAError, Exception):
+                    c_lzma = lzma_fixtures.get((lc, lp, pb))
 
-        s1 = b"FIRST_STREAM_CONTENT_LZMA_" * 30
-        s2 = b"SECOND_STREAM_CONTENT_XZ___" * 30
-        c1 = lzma.compress(s1, format=lzma.FORMAT_ALONE)
-        c2 = lzma.compress(s2, format=lzma.FORMAT_XZ)
+                eng_lzma = XZStreamDecompressor(io.BytesIO(c_lzma))
+                out_lzma = b"".join(
+                    ev.data
+                    for ev in eng_lzma.decode_events()
+                    if ev.type == XZEventType.CHUNK_OUTPUT
+                )
+                self.assertEqual(
+                    out_lzma, data, f"Failed LZMA pb=4 with lc={lc}, lp={lp}, pb={pb}"
+                )
 
-        combined = c1 + c2
-        eng = XZStreamDecompressor(io.BytesIO(combined))
-        out = b"".join(
-            ev.data for ev in eng.decode_events() if ev.type == XZEventType.CHUNK_OUTPUT
-        )
-        self.assertEqual(out, s1 + s2)
+        def test_bug2_legacy_lzma_eof_truncation_detection(self):
+            lzma = self.lzma
+            import io, struct
+
+            raw = b"TRUNCATION_TEST_PAYLOAD_STRING_" * 20
+
+            # Case A: Known uncompressed size header rewritten
+            comp_known = bytearray(lzma.compress(raw, format=lzma.FORMAT_ALONE))
+            comp_known[5:13] = struct.pack("<Q", len(raw))
+
+            for cut in [1, 5, 15, len(comp_known) // 2]:
+                trunc = bytes(comp_known[:-cut])
+                with self.assertRaises((XZFormatError, EOFError)):
+                    eng = XZStreamDecompressor(io.BytesIO(trunc))
+                    list(eng.decode_events())
+
+            # Case B: Unknown uncompressed size (EOS marker) truncated
+            comp_eos = lzma.compress(raw, format=lzma.FORMAT_ALONE)
+            for cut in [2, 6, 12]:
+                trunc_eos = comp_eos[:-cut]
+                with self.assertRaises((XZFormatError, EOFError)):
+                    eng = XZStreamDecompressor(io.BytesIO(trunc_eos))
+                    list(eng.decode_events())
+
+        def test_bug3_legacy_lzma_trailing_bytes_rejection(self):
+            lzma = self.lzma
+            import io
+
+            raw = b"TRAILING_TEST_PAYLOAD_" * 15
+            comp = lzma.compress(raw, format=lzma.FORMAT_ALONE)
+
+            # Trailing random garbage
+            with self.assertRaises(XZFormatError):
+                eng = XZStreamDecompressor(io.BytesIO(comp + b"TRAILING_GARBAGE"))
+                list(eng.decode_events())
+
+            # Four trailing zeros (unsupported after LZMA alone)
+            with self.assertRaises(XZFormatError):
+                eng = XZStreamDecompressor(io.BytesIO(comp + b"\x00\x00\x00\x00"))
+                list(eng.decode_events())
+
+        def test_bug4_legacy_lzma_props_zero(self):
+            lzma = self.lzma
+            import io
+
+            raw = b"PROPS_ZERO_TEST_PAYLOAD_" * 25
+            static_comp = bytes.fromhex(
+                "0000001000ffffffffffffffff0028158a671bda02e192937e9742b55c540136da778c385be7d7c9db61e744f5f66ffff930c400"
+            )
+            try:
+                filters = [
+                    {
+                        "id": lzma.FILTER_LZMA1,
+                        "preset": 0,
+                        "lc": 0,
+                        "lp": 0,
+                        "pb": 0,
+                        "dict_size": 1048576,
+                    }
+                ]
+                comp = lzma.compress(raw, format=lzma.FORMAT_ALONE, filters=filters)
+            except (NotImplementedError, Exception):
+                comp = static_comp
+
+            self.assertEqual(comp[0], 0x00)
+
+            eng = XZStreamDecompressor(io.BytesIO(comp))
+            out = b"".join(
+                ev.data
+                for ev in eng.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out, raw)
+
+        def test_bug5_strict_format_detection_and_empty_input(self):
+            import io
+
+            # 1. Text string starting with <= 224 but invalid dict size
+            with self.assertRaises(XZFormatError):
+                eng = XZStreamDecompressor(io.BytesIO(b"notxz" * 10))
+                list(eng.decode_events())
+
+            # 2. Random garbage input
+            with self.assertRaises(XZFormatError):
+                eng = XZStreamDecompressor(
+                    io.BytesIO(b"\x5d\x12\x34\x56\x78\x9a\xbc\xde\xf0\x11\x22\x33\x44")
+                )
+                list(eng.decode_events())
+
+            # 3. Completely empty input (0 bytes) must fail with XZFormatError (exit 1)
+            with self.assertRaises(XZFormatError):
+                eng = XZStreamDecompressor(io.BytesIO(b""))
+                list(eng.decode_events())
+
+        def test_lzma_9e_postage_stamp_microcontroller_512b_blocks(self):
+            # Even on postage stamp microcontrollers, decompress lzma -9e bit-perfectly with 512B blocks
+            lzma = self.lzma
+            import io, random
+
+            prng = random.Random(1337)
+            raw = bytearray()
+            for _ in range(25):
+                raw.extend(prng.randbytes(500))
+                raw.extend(b"EXTREME_LZMA9E_POSTAGE_STAMP_PATTERN_512B_" * 20)
+                raw.extend(prng.randbytes(300))
+            raw = bytes(raw)
+            c_9e = lzma.compress(raw, preset=9 | lzma.PRESET_EXTREME)
+
+            # Decompress using 512B blocks and 512B RAM history budget
+            vfs = MemoryStorage()
+            hist = UnifiedHistory(
+                storage_driver=vfs, ram_cache_bytes=512, block_size=512
+            )
+            engine = XZStreamDecompressor(
+                io.BytesIO(c_9e), history_backend=hist, block_size=512
+            )
+            out = bytearray()
+            for ev in engine.decode_events():
+                if ev.type == XZEventType.CHUNK_OUTPUT:
+                    out.extend(ev.data)
+                    self.assertLessEqual(len(ev.data), 512)
+            self.assertEqual(bytes(out), raw)
+
+        def test_allowed_block_size_enforcement(self):
+            # Sizing threshold: 512 bytes (< 96 KiB RAM), 8192 bytes (< 512 KiB RAM), 65536 bytes otherwise
+            self.assertEqual(select_block_size("auto", available_mem=32 * 1024), 512)
+            self.assertEqual(select_block_size("auto", available_mem=64 * 1024), 512)
+            self.assertEqual(select_block_size("auto", available_mem=95 * 1024), 512)
+            self.assertEqual(select_block_size("auto", available_mem=96 * 1024), 8192)
+            self.assertEqual(select_block_size("auto", available_mem=511 * 1024), 8192)
+            self.assertEqual(select_block_size("auto", available_mem=512 * 1024), 65536)
+            self.assertEqual(
+                select_block_size("auto", available_mem=16 * 1024 * 1024), 65536
+            )
+
+            # Explicit overrides: only 512, 8192, 65536
+            self.assertEqual(select_block_size(512), 512)
+            self.assertEqual(select_block_size("512"), 512)
+            self.assertEqual(select_block_size("8k"), 8192)
+            self.assertEqual(select_block_size(8192), 8192)
+            self.assertEqual(select_block_size("64k"), 65536)
+            self.assertEqual(select_block_size(65536), 65536)
+
+            # Disallowed sizes raise XZFormatError
+            for bad_sz in [256, 1024, 2048, 4096, 16384, 32768, 131072, "4k", "16k"]:
+                with self.assertRaises(XZFormatError):
+                    select_block_size(bad_sz)
+
+        def test_no_closure_creation_in_decode_loop(self):
+            # RangeDecoder pre-allocated and reused without closure creation
+            lzma = self.lzma
+            import io
+
+            raw = b"NO_CLOSURES_ALLOWED_IN_DECODE_LOOP_" * 50
+            xz_data = lzma.compress(raw, preset=1)
+            eng = XZStreamDecompressor(io.BytesIO(xz_data), block_size=512)
+            blk, eof = eng.decode_block()
+            self.assertGreater(len(blk), 0)
+            self.assertIsNotNone(eng.rd)
+
+        def test_crc64_pure_ram_determination(self):
+            self.assertEqual(crc64(b"123456789"), 0x995DC9BBDF1939FA)
+
+        def test_inbuf_hbuf_external_sharing(self):
+            vfs = MemoryStorage()
+            hist = UnifiedHistory(
+                storage_driver=vfs, ram_cache_bytes=512, block_size=512
+            )
+            hist.append_block(b"S" * 512)
+            self.assertEqual(hist.blocks_len, 512)
+
+        def test_concatenation_all_four_flavors_and_padding(self):
+            # Comprehensive validation of all 4 concatenation flavors (xz+xz, xz+lzma, lzma+xz, lzma+lzma)
+            lzma = self.lzma
+            import io
+
+            class NonSeekPipe(getattr(io, "RawIOBase", object)):
+                def __init__(self, raw_bytes):
+                    self.buf = io.BytesIO(raw_bytes)
+
+                def read(self, n=-1):
+                    return self.buf.read(n)
+
+                def readable(self):
+                    return True
+
+                def seekable(self):
+                    return False
+
+            s1 = b"STREAM_FIRST_CONTENT_ABCDEF_" * 35
+            s2 = b"STREAM_SECOND_CONTENT_GHIJKL_" * 35
+            c_xz1 = lzma.compress(s1, format=lzma.FORMAT_XZ)
+            c_xz2 = lzma.compress(s2, format=lzma.FORMAT_XZ)
+            c_lzma1 = lzma.compress(s1, format=lzma.FORMAT_ALONE)
+            c_lzma2 = lzma.compress(s2, format=lzma.FORMAT_ALONE)
+
+            pairs = [
+                ("xz+xz", c_xz1, c_xz2),
+                ("xz+lzma", c_xz1, c_lzma2),
+                ("lzma+xz", c_lzma1, c_xz2),
+                ("lzma+lzma", c_lzma1, c_lzma2),
+            ]
+            for name, c1, c2 in pairs:
+                for pad in [0, 4, 8]:
+                    combined = c1 + (b"\x00" * pad) + c2
+                    # Seekable stream
+                    eng_seek = XZStreamDecompressor(io.BytesIO(combined))
+                    out_seek = b"".join(
+                        ev.data
+                        for ev in eng_seek.decode_events()
+                        if ev.type == XZEventType.CHUNK_OUTPUT
+                    )
+                    self.assertEqual(
+                        out_seek, s1 + s2, f"Failed seekable {name} pad={pad}"
+                    )
+
+                    # Unseekable pipe stream
+                    eng_pipe = XZStreamDecompressor(NonSeekPipe(combined))
+                    out_pipe = b"".join(
+                        ev.data
+                        for ev in eng_pipe.decode_events()
+                        if ev.type == XZEventType.CHUNK_OUTPUT
+                    )
+                    self.assertEqual(
+                        out_pipe, s1 + s2, f"Failed unseekable {name} pad={pad}"
+                    )
+
+        def test_cli_custom_streams_stdin_stdout(self):
+            import binascii
+
+            b64_data = self._BAKED_VECTORS[0][1]
+            xz_data = binascii.a2b_base64(b64_data)
+            expected = self._baked_raw(self._BAKED_VECTORS[0][2])
+
+            fake_in = io.BytesIO(xz_data)
+            fake_out = io.BytesIO()
+            fake_err = io.StringIO()
+
+            code = main(
+                ["-", "-o", "-"], stdin=fake_in, stdout=fake_out, stderr=fake_err
+            )
+            self.assertEqual(code, 0)
+            self.assertEqual(fake_out.getvalue(), expected)
+            self.assertIn("[xz:stream end]", fake_err.getvalue())
+
+        def test_cli_custom_streams_error_reporting(self):
+            fake_in = io.BytesIO(b"NOT_A_VALID_XZ_STREAM")
+            fake_out = io.BytesIO()
+            fake_err = io.StringIO()
+
+            code = main(
+                ["-", "-o", "-"], stdin=fake_in, stdout=fake_out, stderr=fake_err
+            )
+            self.assertEqual(code, E_FORMAT)
+            self.assertIn("xz_decompressor: E_FORMAT:", fake_err.getvalue())
+
+        def test_cli_main_help_output(self):
+            if not _IS_DESKTOP_PY:
+                self.skipTest("micropython-lib argparse unredirectable stdout")
+            fake_out = io.StringIO()
+            fake_err = io.StringIO()
+            try:
+                code = main(["--help"], stdout=fake_out, stderr=fake_err)
+            except SystemExit as e:
+                code = getattr(e, "code", None)
+                if code is None:
+                    code = e.args[0] if e.args else 0
+            self.assertEqual(code, 0)
+            self.assertIn("usage:", fake_out.getvalue().lower())
+
+        def test_concatenated_intermixed_lzma_xz_streams(self):
+            lzma = self.lzma
+            import io
+
+            s1 = b"FIRST_STREAM_CONTENT_LZMA_" * 30
+            s2 = b"SECOND_STREAM_CONTENT_XZ___" * 30
+            c1 = lzma.compress(s1, format=lzma.FORMAT_ALONE)
+            c2 = lzma.compress(s2, format=lzma.FORMAT_XZ)
+
+            combined = c1 + c2
+            eng = XZStreamDecompressor(io.BytesIO(combined))
+            out = b"".join(
+                ev.data
+                for ev in eng.decode_events()
+                if ev.type == XZEventType.CHUNK_OUTPUT
+            )
+            self.assertEqual(out, s1 + s2)
+
+else:
+    unittest = None
 
 
-def main():
+def _run_embedded_tests(
+    argv=sys.argv, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr
+):
+    if "TestXZDecompressor" not in globals() or globals()["TestXZDecompressor"] is None:
+        stderr.write("--test disabled: tests are not included in this build\n")
+        return False
+    TestXZDecompressor.stdin = stdin
+    TestXZDecompressor.stdout = stdout
+    TestXZDecompressor.stderr = stderr
+    TestXZDecompressor.argv = argv
+
+    loader = getattr(unittest, "TestLoader", None)
+    if loader is not None:
+        suite = loader().loadTestsFromTestCase(TestXZDecompressor)
+        runner = unittest.TextTestRunner(stream=stderr, verbosity=2)
+    else:
+        if hasattr(TestXZDecompressor, "_micropython_prepare"):
+            TestXZDecompressor._micropython_prepare()
+        suite = unittest.TestSuite()
+        suite.addTest(TestXZDecompressor)
+        runner = unittest.TextTestRunner()
+    res = runner.run(suite)
+    return (
+        res.wasSuccessful()
+        if hasattr(res, "wasSuccessful")
+        else (len(getattr(res, "errors", [])) == 0)
+    )
+
+
+def main(argv=sys.argv, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr):
+    args_list = argv[1:] if argv is sys.argv else argv
+
+    def _write_err(msg):
+        stderr.write(msg)
+        if hasattr(stderr, "flush"):
+            try:
+                stderr.flush()
+            except Exception:
+                pass
+
     try:
         import argparse
     except ImportError:
@@ -6787,23 +7277,35 @@ def main():
                 "--test", action="store_true", help="Run self-contained unit test suite"
             )
 
-        args = parser.parse_args()
+        if ("-h" in args_list or "--help" in args_list) and hasattr(
+            parser, "print_help"
+        ):
+            parser.print_help(file=stdout)
+            return 0
+
+        try:
+            args = parser.parse_args(args_list)
+        except SystemExit as e:
+            return getattr(e, "code", e.args[0] if e.args else 0)
 
         if hasattr(args, "test") and args.test:
             if unittest is None:
-                sys.stderr.write(
+                _write_err(
                     "--test disabled: unittest is not available in this environment\n"
                 )
-                sys.exit(1)
-            suite = unittest.TestLoader().loadTestsFromTestCase(TestXZDecompressor)
-            runner = unittest.TextTestRunner(verbosity=2)
-            result = runner.run(suite)
-            sys.exit(0 if result.wasSuccessful() else 1)
-        elif "--test" in sys.argv and unittest is None:
-            sys.stderr.write(
+                return 1
+            return (
+                0
+                if _run_embedded_tests(
+                    argv=argv, stdin=stdin, stdout=stdout, stderr=stderr
+                )
+                else 1
+            )
+        elif "--test" in args_list and unittest is None:
+            _write_err(
                 "--test disabled: unittest is not available in this environment\n"
             )
-            sys.exit(1)
+            return 1
 
         input_src = args.input
         output_dst = args.output
@@ -6854,7 +7356,7 @@ def main():
         is_v = False
         ign_space = False
 
-        argv = sys.argv[1:]
+        argv = list(args_list)
         i = 0
         while i < len(argv):
             arg = argv[i]
@@ -6871,11 +7373,14 @@ def main():
                     sys.stderr.write(
                         "--test disabled: unittest is not available in this environment\n"
                     )
-                    sys.exit(1)
-                suite = unittest.TestLoader().loadTestsFromTestCase(TestXZDecompressor)
-                runner = unittest.TextTestRunner(verbosity=2)
-                result = runner.run(suite)
-                sys.exit(0 if result.wasSuccessful() else 1)
+                    return 1
+                return (
+                    0
+                    if _run_embedded_tests(
+                        argv=argv, stdin=stdin, stdout=stdout, stderr=stderr
+                    )
+                    else 1
+                )
             elif arg == "-o" and i + 1 < len(argv):
                 i += 1
                 output_dst = argv[i]
@@ -6949,19 +7454,6 @@ def main():
             elif not arg.startswith("-"):
                 input_src = arg
             i += 1
-
-    if __name__ == "__main__":
-        if (
-            "TestXZDecompressor" in globals()
-            and globals()["TestXZDecompressor"] is not None
-        ):
-            del globals()["TestXZDecompressor"]
-        if "unittest" in globals() and globals()["unittest"] is not None:
-            del globals()["unittest"]
-        try:
-            gc.collect()
-        except Exception:
-            pass
 
     def _supports_unicode():
         try:
@@ -7042,7 +7534,7 @@ def main():
     last_spin_bytes = [0]
     last_status_print_time = [0.0]
     out_is_stdout = output_dst == "-"
-    stderr_has_isatty = hasattr(sys.stderr, "isatty")
+    stderr_has_isatty = hasattr(stderr, "isatty")
     spinner_active = [False]
 
     time_width = 10
@@ -7062,7 +7554,7 @@ def main():
 
         glyph = spinner[spin_idx[0] % len(spinner)]
         spin_idx[0] += 1
-        if (stderr_has_isatty and sys.stderr.isatty()) or (not out_is_stdout):
+        if (stderr_has_isatty and stderr.isatty()) or (not out_is_stdout):
             tot_ms = getattr(ev, "elapsed_ms", None)
             if tot_ms is None:
                 tot_ms = int((now - init_perf) * 1000)
@@ -7083,10 +7575,11 @@ def main():
                 time_field = f"{time_str:>{time_width}}"
 
             line = f"{glyph} {time_field} {format_human_size(ev.total_emitted):>10} decoded, {format_human_rate(rate):>12}"
-            sys.stderr.write(f"{line:<{status_width}}\r")
+            stderr.write(f"{line:<{status_width}}\r")
             spinner_active[0] = True
             try:
-                sys.stderr.flush()
+                if hasattr(stderr, "flush"):
+                    stderr.flush()
             except Exception:
                 pass
 
@@ -7113,11 +7606,15 @@ def main():
                 checkpoint_interval=c_int,
                 resume_id=res_id,
                 ignore_space_check=ign_space,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
             )
             if spinner_active[0]:
-                sys.stderr.write(" " * 56 + "\r")
+                stderr.write(" " * 56 + "\r")
                 try:
-                    sys.stderr.flush()
+                    if hasattr(stderr, "flush"):
+                        stderr.flush()
                 except Exception:
                     pass
         finally:
@@ -7127,40 +7624,41 @@ def main():
             except Exception:
                 pass
     except (WallClockTimeout, CPUTimeout):
-        sys.exit(124)
+        return 124
     except KeyboardInterrupt:
-        sys.exit(130)
+        return 130
     except XZFormatError as exc:
         if is_v:
             raise
-        sys.stderr.write(f"xz_decompressor: E_FORMAT: {exc}\n")
-        sys.exit(E_FORMAT)
+        _write_err(f"xz_decompressor: E_FORMAT: {exc}\n")
+        return E_FORMAT
     except XZUnsupportedError as exc:
         if is_v:
             raise
-        sys.stderr.write(f"xz_decompressor: E_UNSUPPORTED: {exc}\n")
-        sys.exit(E_UNSUPPORTED)
+        _write_err(f"xz_decompressor: E_UNSUPPORTED: {exc}\n")
+        return E_UNSUPPORTED
     except XZCheckError as exc:
         if is_v:
             raise
-        sys.stderr.write(f"xz_decompressor: E_CHECK: {exc}\n")
-        sys.exit(E_CHECK)
+        _write_err(f"xz_decompressor: E_CHECK: {exc}\n")
+        return E_CHECK
     except (EOFError, ValueError) as exc:
         if is_v:
             raise
-        sys.stderr.write(f"xz_decompressor: E_FORMAT: {exc}\n")
-        sys.exit(E_FORMAT)
+        _write_err(f"xz_decompressor: E_FORMAT: {exc}\n")
+        return E_FORMAT
     except OSError as exc:
         if is_v:
             raise
-        sys.stderr.write(f"xz_decompressor: E_IO: {exc}\n")
-        sys.exit(E_IO)
+        _write_err(f"xz_decompressor: E_IO: {exc}\n")
+        return E_IO
     except Exception as exc:
         if is_v:
             raise
-        sys.stderr.write(f"xz_decompressor: E_RESOURCE: {exc}\n")
-        sys.exit(E_RESOURCE)
+        _write_err(f"xz_decompressor: E_RESOURCE: {exc}\n")
+        return E_RESOURCE
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
