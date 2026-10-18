@@ -188,6 +188,8 @@ else:
 
     micropython = _MicroPythonShim()
 
+__version__ = "0.1.0"
+
 
 # ==============================================================================
 # 2. PREPROCESSOR ENTRYPOINT & SELF-TEST SUITE
@@ -220,97 +222,6 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
             stdout = sys.stdout
         if stderr is None:
             stderr = sys.stderr
-
-    # --- Self-Contained Test Mode (Compiled away when __debug__ is False) ---
-    if __debug__:
-        if "--test" in argv:
-            try:
-                import unittest
-            except ImportError:
-                stderr.write(
-                    "--test disabled: unittest is not available in this environment\n"
-                )
-                return 1
-
-            global TestAstpp
-
-            class TestAstpp(unittest.TestCase):
-                """Self-test suite for astpp runtime helpers, inlining, and docstring examples."""
-
-                def test_runtime_helpers(self):
-                    """Validate behavior of const, keep, omit, keep_if, omit_if, and micropython shims."""
-                    self.assertEqual(const(123), 123)
-                    self.assertEqual(keep(42), 42)
-                    self.assertIsNone(omit(42))
-                    self.assertEqual(keep_if(True)(99), 99)
-                    self.assertIsNone(keep_if(False)(99))
-                    self.assertIsNone(omit_if(True)(99))
-                    self.assertEqual(omit_if(False)(99), 99)
-                    self.assertEqual(micropython.native(10), 10)
-                    self.assertEqual(micropython.viper(20), 20)
-
-                def test_docstring_examples(self):
-                    """Parse all documented examples directly from __doc__ and verify against astpp_main."""
-                    import io, re, shlex, sys
-
-                    doc = sys.modules[__name__].__doc__ or __doc__
-                    pattern = re.compile(
-                        r"Input:\s*```python\s*(.*?)\s*```\s*Flags:\s*(.*?)\s*Output:\s*```python\s*(.*?)\s*```",
-                        re.DOTALL,
-                    )
-                    matches = pattern.findall(doc)
-                    self.assertGreaterEqual(
-                        len(matches), 5, "Must find at least 5 docstring examples"
-                    )
-
-                    for idx, (inp, flags_str, expected) in enumerate(matches):
-                        flags = shlex.split(flags_str.strip())
-                        fake_in = io.StringIO(inp.strip() + "\n")
-                        fake_out = io.StringIO()
-                        fake_err = io.StringIO()
-                        rc = astpp_main(flags, fake_in, fake_out, fake_err)
-                        self.assertEqual(
-                            rc, 0, f"Example {idx+1} failed with rc={rc}: {flags}"
-                        )
-
-                        actual_ast = ast.parse(fake_out.getvalue().strip())
-                        exp_ast = ast.parse(expected.strip())
-                        self.assertEqual(
-                            ast.dump(actual_ast),
-                            ast.dump(exp_ast),
-                            f"Example {idx+1} AST mismatch!\nActual:\n{fake_out.getvalue()}\nExpected:\n{expected}",
-                        )
-
-                def test_cli_help_flag(self):
-                    """Validate that --help writes formatted usage to stdout without process exit."""
-                    import io, re
-
-                    help_out = io.StringIO()
-                    rc = astpp_main(["--help"], stdout=help_out, stderr=io.StringIO())
-                    self.assertEqual(rc, 0)
-                    val = help_out.getvalue()
-                    clean_val = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", val)
-                    self.assertIn("usage: astpp", clean_val)
-                    self.assertIn("-D NAME=VALUE", clean_val)
-
-            loader = getattr(unittest, "TestLoader", None)
-            if loader is not None:
-                suite = loader().loadTestsFromTestCase(TestAstpp)
-                runner = unittest.TextTestRunner(stream=stderr, verbosity=2)
-            else:
-                suite = unittest.TestSuite()
-                suite.addTest(TestAstpp)
-                runner = unittest.TextTestRunner()
-            res = runner.run(suite)
-            return (
-                0
-                if (
-                    res.wasSuccessful()
-                    if hasattr(res, "wasSuccessful")
-                    else len(getattr(res, "errors", [])) == 0
-                )
-                else 1
-            )
 
     # --- Argument Parser & Normal Filter Mode ---
     def _build_parser():
@@ -379,6 +290,101 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
         if c is None:
             c = e.args[0] if e.args else 0
         return c
+
+    # --- Self-Contained Test Mode ---
+    if args.test:
+        if not __debug__:
+            stderr.write("--test is not available in optimized builds\n")
+            if hasattr(stderr, "flush"):
+                stderr.flush()
+            return 1
+        try:
+            import unittest
+        except ImportError:
+            stderr.write(
+                "--test disabled: unittest is not available in this environment\n"
+            )
+            return 1
+
+        global TestAstpp
+
+        class TestAstpp(unittest.TestCase):
+            """Self-test suite for astpp runtime helpers, inlining, and docstring examples."""
+
+            def test_runtime_helpers(self):
+                """Validate behavior of const, keep, omit, keep_if, omit_if, and micropython shims."""
+                self.assertEqual(const(123), 123)
+                self.assertEqual(keep(42), 42)
+                self.assertIsNone(omit(42))
+                self.assertEqual(keep_if(True)(99), 99)
+                self.assertIsNone(keep_if(False)(99))
+                self.assertIsNone(omit_if(True)(99))
+                self.assertEqual(omit_if(False)(99), 99)
+                self.assertEqual(micropython.native(10), 10)
+                self.assertEqual(micropython.viper(20), 20)
+
+            def test_docstring_examples(self):
+                """Parse all documented examples directly from __doc__ and verify against astpp_main."""
+                import io, re, shlex, sys
+
+                doc = sys.modules[__name__].__doc__ or __doc__
+                pattern = re.compile(
+                    r"Input:\s*```python\s*(.*?)\s*```\s*Flags:\s*(.*?)\s*Output:\s*```python\s*(.*?)\s*```",
+                    re.DOTALL,
+                )
+                matches = pattern.findall(doc)
+                self.assertGreaterEqual(
+                    len(matches), 5, "Must find at least 5 docstring examples"
+                )
+
+                for idx, (inp, flags_str, expected) in enumerate(matches):
+                    flags = shlex.split(flags_str.strip())
+                    fake_in = io.StringIO(inp.strip() + "\n")
+                    fake_out = io.StringIO()
+                    fake_err = io.StringIO()
+                    rc = astpp_main(flags, fake_in, fake_out, fake_err)
+                    self.assertEqual(
+                        rc, 0, f"Example {idx+1} failed with rc={rc}: {flags}"
+                    )
+
+                    actual_ast = ast.parse(fake_out.getvalue().strip())
+                    exp_ast = ast.parse(expected.strip())
+                    self.assertEqual(
+                        ast.dump(actual_ast),
+                        ast.dump(exp_ast),
+                        f"Example {idx+1} AST mismatch!\nActual:\n{fake_out.getvalue()}\nExpected:\n{expected}",
+                    )
+
+            def test_cli_help_flag(self):
+                """Validate that --help writes formatted usage to stdout without process exit."""
+                import io, re
+
+                help_out = io.StringIO()
+                rc = astpp_main(["--help"], stdout=help_out, stderr=io.StringIO())
+                self.assertEqual(rc, 0)
+                val = help_out.getvalue()
+                clean_val = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", val)
+                self.assertIn("usage: astpp", clean_val)
+                self.assertIn("-D NAME=VALUE", clean_val)
+
+        loader = getattr(unittest, "TestLoader", None)
+        if loader is not None:
+            suite = loader().loadTestsFromTestCase(TestAstpp)
+            runner = unittest.TextTestRunner(stream=stderr, verbosity=2)
+        else:
+            suite = unittest.TestSuite()
+            suite.addTest(TestAstpp)
+            runner = unittest.TextTestRunner()
+        res = runner.run(suite)
+        return (
+            0
+            if (
+                res.wasSuccessful()
+                if hasattr(res, "wasSuccessful")
+                else len(getattr(res, "errors", [])) == 0
+            )
+            else 1
+        )
 
     def _parse_val(v_str):
         if v_str == "True":
@@ -620,7 +626,12 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
     return 0
 
 
-if __name__ == "__main__":
+def main():
+    """Command-line entrypoint for pip-installed astpp console script."""
     import sys
 
     sys.exit(astpp_main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))
+
+
+if __name__ == "__main__":
+    main()
