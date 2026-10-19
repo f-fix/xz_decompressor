@@ -188,12 +188,15 @@ else:
 
     micropython = _MicroPythonShim()
 
-__version__ = "0.1.0"
+_OMIT_MAIN = const(False)
+
+__version__ = "0.1.1"
 
 
 # ==============================================================================
 # 2. PREPROCESSOR ENTRYPOINT & SELF-TEST SUITE
 # ==============================================================================
+@omit_if(_OMIT_MAIN)
 def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
     """Programmatic entrypoint for AST-level preprocessing, help display, and self-testing.
 
@@ -355,6 +358,66 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
                         f"Example {idx+1} AST mismatch!\nActual:\n{fake_out.getvalue()}\nExpected:\n{expected}",
                     )
 
+            def test_constant_expressions_and_pruning(self):
+                """Validate constant comparisons (==, !=, <, etc.), boolean logic, and 'if not' pruning."""
+                import io
+
+                src = """
+_FLAG = const(True)
+_VAL = const(42)
+
+if not _FLAG:
+    dead_code_1 = 1
+
+if _FLAG:
+    live_code_1 = 2
+
+if _VAL == 42:
+    live_code_2 = 3
+
+if _VAL != 42:
+    dead_code_2 = 4
+
+if _VAL > 100:
+    dead_code_3 = 5
+elif _VAL < 50:
+    live_code_3 = 6
+"""
+                fake_in = io.StringIO(src)
+                fake_out = io.StringIO()
+                rc = astpp_main([], fake_in, fake_out, io.StringIO())
+                self.assertEqual(rc, 0)
+                out = fake_out.getvalue()
+                self.assertNotIn("dead_code", out)
+                self.assertIn("live_code_1 = 2", out)
+                self.assertIn("live_code_2 = 3", out)
+                self.assertIn("live_code_3 = 6", out)
+
+            def test_omit_main_pruning(self):
+                """Validate that -D_OMIT_MAIN=True drops @omit_if(_OMIT_MAIN) functions and if not _OMIT_MAIN blocks."""
+                import io
+
+                src = """
+from astpp import const, omit_if
+_OMIT_MAIN = const(False)
+
+@omit_if(_OMIT_MAIN)
+def main():
+    return "cli_active"
+
+if not _OMIT_MAIN:
+    if __name__ == "__main__":
+        main()
+"""
+                fake_in = io.StringIO(src)
+                fake_out = io.StringIO()
+                rc = astpp_main(["-D_OMIT_MAIN=True"], fake_in, fake_out, io.StringIO())
+                self.assertEqual(rc, 0)
+                out = fake_out.getvalue()
+                self.assertNotIn("def main", out)
+                self.assertNotIn('__name__ == "__main__"', out)
+                self.assertIn("_OMIT_MAIN = const(True)", out)
+
             def test_cli_help_flag(self):
                 """Validate that --help writes formatted usage to stdout without process exit."""
                 import io, re
@@ -450,6 +513,8 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
                 defs.update(_defined_names(n))
         return defs
 
+    _UNEVALUATED = object()
+
     class Preprocessor(ast.NodeTransformer):
         """AST transformer enforcing constant propagation, branch pruning, and inlining."""
 
@@ -461,11 +526,117 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
             if isinstance(node, ast.Constant):
                 return node.value
             if isinstance(node, ast.Name):
-                return self.constants.get(node.id, None)
-            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                if node.id in self.constants:
+                    return self.constants[node.id]
+                return _UNEVALUATED
+            if isinstance(node, ast.UnaryOp):
                 v = self._eval_const(node.operand)
-                return (not v) if v is not None else None
-            return None
+                if v is not _UNEVALUATED:
+                    try:
+                        if isinstance(node.op, ast.Not):
+                            return not v
+                        if isinstance(node.op, ast.USub):
+                            return -v
+                        if isinstance(node.op, ast.UAdd):
+                            return +v
+                        if isinstance(node.op, ast.Invert):
+                            return ~v
+                    except Exception:
+                        pass
+                return _UNEVALUATED
+            if isinstance(node, ast.BinOp):
+                left = self._eval_const(node.left)
+                right = self._eval_const(node.right)
+                if left is not _UNEVALUATED and right is not _UNEVALUATED:
+                    try:
+                        if isinstance(node.op, ast.Add):
+                            return left + right
+                        if isinstance(node.op, ast.Sub):
+                            return left - right
+                        if isinstance(node.op, ast.Mult):
+                            return left * right
+                        if isinstance(node.op, ast.Div):
+                            return left / right
+                        if isinstance(node.op, ast.FloorDiv):
+                            return left // right
+                        if isinstance(node.op, ast.Mod):
+                            return left % right
+                        if isinstance(node.op, ast.Pow):
+                            return left**right
+                        if isinstance(node.op, ast.LShift):
+                            return left << right
+                        if isinstance(node.op, ast.RShift):
+                            return left >> right
+                        if isinstance(node.op, ast.BitOr):
+                            return left | right
+                        if isinstance(node.op, ast.BitXor):
+                            return left ^ right
+                        if isinstance(node.op, ast.BitAnd):
+                            return left & right
+                    except Exception:
+                        pass
+                return _UNEVALUATED
+            if isinstance(node, ast.BoolOp):
+                vals = [self._eval_const(v) for v in node.values]
+                if isinstance(node.op, ast.And):
+                    for v in vals:
+                        if v is not _UNEVALUATED and not bool(v):
+                            return False
+                        if v is _UNEVALUATED:
+                            return _UNEVALUATED
+                    return vals[-1]
+                elif isinstance(node.op, ast.Or):
+                    for v in vals:
+                        if v is not _UNEVALUATED and bool(v):
+                            return True
+                        if v is _UNEVALUATED:
+                            return _UNEVALUATED
+                    return vals[-1]
+                return _UNEVALUATED
+            if isinstance(node, ast.Compare):
+                left = self._eval_const(node.left)
+                if left is _UNEVALUATED:
+                    return _UNEVALUATED
+                cur = left
+                for op, comp in zip(node.ops, node.comparators):
+                    right = self._eval_const(comp)
+                    if right is _UNEVALUATED:
+                        return _UNEVALUATED
+                    try:
+                        if isinstance(op, ast.Eq):
+                            matched = cur == right
+                        elif isinstance(op, ast.NotEq):
+                            matched = cur != right
+                        elif isinstance(op, ast.Lt):
+                            matched = cur < right
+                        elif isinstance(op, ast.LtE):
+                            matched = cur <= right
+                        elif isinstance(op, ast.Gt):
+                            matched = cur > right
+                        elif isinstance(op, ast.GtE):
+                            matched = cur >= right
+                        elif isinstance(op, ast.Is):
+                            matched = cur is right
+                        elif isinstance(op, ast.IsNot):
+                            matched = cur is not right
+                        elif isinstance(op, ast.In):
+                            matched = cur in right
+                        elif isinstance(op, ast.NotIn):
+                            matched = cur not in right
+                        else:
+                            return _UNEVALUATED
+                    except Exception:
+                        return _UNEVALUATED
+                    if not matched:
+                        return False
+                    cur = right
+                return True
+            if isinstance(node, (ast.Tuple, ast.List)):
+                items = [self._eval_const(e) for e in node.elts]
+                if any(x is _UNEVALUATED for x in items):
+                    return _UNEVALUATED
+                return tuple(items) if isinstance(node, ast.Tuple) else list(items)
+            return _UNEVALUATED
 
         def _strip_docstrings(self, body):
             """Strip docstring expression nodes when optimization level >= 2 (-OO / -O2)."""
@@ -533,7 +704,7 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
                         and getattr(node.value.func, "id", None) == "const"
                     ):
                         val = self._eval_const(node.value.args[0])
-                        if val is not None:
+                        if val is not _UNEVALUATED:
                             self.constants[name] = val
             return self.generic_visit(node)
 
@@ -554,21 +725,20 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
             """Eliminate dead branches and promote reachable bodies for compile-time if/elif/else."""
             self.generic_visit(node)
             cond = self._eval_const(node.test)
-            if cond is True:
-                node.orelse = []
-                return node.body
-            if cond is False:
-                if not node.orelse:
-                    return None
-                if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
-                    return node.orelse[0]
-                return node.orelse
-            if (
-                len(node.orelse) == 1
-                and isinstance(node.orelse[0], ast.If)
-                and self._eval_const(node.orelse[0].test) is False
-            ):
-                node.orelse = node.orelse[0].orelse
+            if cond is not _UNEVALUATED:
+                if bool(cond):
+                    node.orelse = []
+                    return node.body
+                else:
+                    if not node.orelse:
+                        return None
+                    if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+                        return node.orelse[0]
+                    return node.orelse
+            if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
+                sub_cond = self._eval_const(node.orelse[0].test)
+                if sub_cond is not _UNEVALUATED and not bool(sub_cond):
+                    node.orelse = node.orelse[0].orelse
             return node
 
         def _handle_def(self, node):
@@ -582,9 +752,12 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
                     "omit_if",
                 ):
                     cond = self._eval_const(d.args[0])
-                    if d.func.id == "omit_if":
-                        cond = not cond
-                    res = "keep" if cond else "omit"
+                    if cond is not _UNEVALUATED:
+                        if d.func.id == "omit_if":
+                            cond = not cond
+                        res = "keep" if bool(cond) else "omit"
+                    else:
+                        res = dec_str
                 elif dec_str in ("keep", "omit"):
                     res = dec_str
                 else:
@@ -626,6 +799,7 @@ def astpp_main(argv=None, stdin=None, stdout=None, stderr=None):
     return 0
 
 
+@omit_if(_OMIT_MAIN)
 def main():
     """Command-line entrypoint for pip-installed astpp console script."""
     import sys
@@ -633,5 +807,6 @@ def main():
     sys.exit(astpp_main(sys.argv[1:], sys.stdin, sys.stdout, sys.stderr))
 
 
-if __name__ == "__main__":
-    main()
+if not _OMIT_MAIN:
+    if __name__ == "__main__":
+        main()
