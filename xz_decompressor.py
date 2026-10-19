@@ -16,10 +16,12 @@ import io
 import array
 import gc
 
-try:
-    from micropython import const
-except ImportError:
-    const = lambda x: x
+from astpp import const, keep, keep_if, omit, omit_if, micropython
+
+_OMIT_MAIN = const(False)
+_IS_DESKTOP_PY = getattr(
+    sys, "implementation", None
+) is not None and sys.implementation.name in ("cpython", "pypy")
 
 _PROB_INIT = const(1024)
 _PROB_BITS = const(11)
@@ -60,9 +62,6 @@ _PROB_INIT_ELEMENT = struct.pack("<H", _PROB_INIT)
 _USE_LIT_FN = getattr(sys, "implementation", None) is None or (
     sys.implementation.name != "pypy"
 )
-_IS_DESKTOP_PY = getattr(
-    sys, "implementation", None
-) is not None and sys.implementation.name in ("cpython", "pypy")
 
 
 def _make_prob_array(count):
@@ -74,16 +73,68 @@ def _make_prob_array(count):
     return array.array("H", (1024 for _ in range(count)))
 
 
-def _make_lit_tables(num_tables):
-    # Preallocates num_tables sub-tables of 768 elements (1.5 KiB each).
-    # Maximum single allocation is only 1.5 KiB (1536 bytes), completely eliminating
-    # contiguous allocation failures on constrained microcontrollers down to ~24 KiB RAM!
+_RESET_NYBBLES = b"\xcc" * 384
+
+
+def make_1152_table():
+    buf = bytearray(1152)
+    buf[768:] = _RESET_NYBBLES
+    return buf
+
+
+def _should_pack_lit_tables(available_mem=None):
+    if _IS_DESKTOP_PY:
+        return False
+    if available_mem is None:
+        available_mem = get_available_memory()
+    return available_mem < 32 * 1024
+
+
+def _make_lit_tables(num_tables, packed=False):
+    if packed:
+        return [make_1152_table() for _ in range(num_tables)]
     return [_make_prob_array(_LIT_BASE_SIZE) for _ in range(num_tables)]
 
 
 def _reset_lit_tables(tables):
     for sub in tables:
-        _reset_prob_array(sub)
+        if isinstance(sub, bytearray):
+            sub[768:] = _RESET_NYBBLES
+        else:
+            _reset_prob_array(sub)
+
+
+def pack_1152_from_array(arr):
+    buf = bytearray(1152)
+    buf[768:] = _RESET_NYBBLES
+    for i in range(len(arr)):
+        p = arr[i]
+        if p != 1024:
+            high3 = (p >> 8) & 0x07
+            low8 = p & 0xFF
+            nyb_idx = 768 + (i >> 1)
+            if low8:
+                buf[i] = low8
+                new_nyb = high3
+            else:
+                new_nyb = 0x08 | high3
+            if i & 1:
+                buf[nyb_idx] = (buf[nyb_idx] & 0x0F) | (new_nyb << 4)
+            else:
+                buf[nyb_idx] = (buf[nyb_idx] & 0xF0) | new_nyb
+    return buf
+
+
+def unpack_1152_to_array(buf):
+    arr = array.array("H", [0] * 768)
+    for i in range(768):
+        nyb_byte = buf[768 + (i >> 1)]
+        nyb = (nyb_byte >> 4) if (i & 1) else (nyb_byte & 0x0F)
+        if nyb & 0x08:
+            arr[i] = (nyb & 0x07) << 8
+        else:
+            arr[i] = ((nyb & 0x07) << 8) | buf[i]
+    return arr
 
 
 def _reset_prob_array(arr):
@@ -391,21 +442,7 @@ else:
     except Exception:
         Path = _PathFallback
 
-# MicroPython native machine code decorator shim
-try:
-    import micropython
-except ImportError:
-
-    class _MicroPythonShim:
-        @staticmethod
-        def native(fn):
-            return fn
-
-        @staticmethod
-        def viper(fn):
-            return fn
-
-    micropython = _MicroPythonShim()
+# micropython decorator shim provided by astpp
 
 try:
     import binascii
@@ -630,10 +667,12 @@ def parse_duration(val_str):
         return float(val_str)
 
 
+@keep_if(_IS_DESKTOP_PY)
 def _days_before_year(y):
     return y * 365 + y // 4 - y // 100 + y // 400
 
 
+@keep_if(_IS_DESKTOP_PY)
 def _days_before_month(year, month):
     days = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
     is_leap = (year % 4 == 0 and year % 100 != 0) or (year % 400 == 0)
@@ -643,6 +682,7 @@ def _days_before_month(year, month):
     return d
 
 
+@keep_if(_IS_DESKTOP_PY)
 def timegm_pure(year, month, day, hour=0, minute=0, second=0):
     days = (
         _days_before_year(year - 1)
@@ -653,6 +693,7 @@ def timegm_pure(year, month, day, hour=0, minute=0, second=0):
     return days * 86400 + hour * 3600 + minute * 60 + second
 
 
+@keep_if(_IS_DESKTOP_PY)
 def parse_iso8601_flexible(s):
     s = str(s).strip()
     if s.endswith("Z") or s.endswith("z"):
@@ -1270,9 +1311,16 @@ class UnifiedHistory(HistoryBackend):
         self.blocks = []
         self.blocks_len = 0
         self.in_ram_only = self.output_file is None and self.storage is None
-        self._recycled_block = (
-            bytearray(self.block_size) if self.max_blocks == 1 else None
-        )
+        # Preallocated fixed-capacity free list: prevents later OOM failures by dying immediately at startup
+        # List remains fixed length: withdrawn slots replaced with None, recycled slots fill from the left
+        if not self.in_ram_only:
+            self._free_blocks = [
+                bytearray(self.block_size) for _ in range(self.max_blocks)
+            ]
+            self._free_count = self.max_blocks
+        else:
+            self._free_blocks = []
+            self._free_count = 0
 
     def set_output_file(self, output_file):
         """Bind seekable output file as history tier 2 and close/remove any scratch file."""
@@ -1306,31 +1354,37 @@ class UnifiedHistory(HistoryBackend):
         if b_len == 0:
             return
 
-        if (
-            not self.in_ram_only
-            and self._recycled_block is not None
-            and b_len <= len(self._recycled_block)
+        max_b = (
+            (self.max_history // self.block_size)
+            if self.in_ram_only
+            else self.max_blocks
+        )
+        limit = self.max_history if self.in_ram_only else self.ram_cache_bytes
+        while self.blocks and (
+            len(self.blocks) >= max_b or (self.blocks_len + b_len) > limit
         ):
-            self._recycled_block[:b_len] = block_data
-            if not self.blocks:
-                self.blocks.append(self._recycled_block)
-            self.blocks_len = b_len
-        else:
-            max_b = (
-                (self.max_history // self.block_size)
-                if self.in_ram_only
-                else self.max_blocks
-            )
-            limit = self.max_history if self.in_ram_only else self.ram_cache_bytes
-            while self.blocks and (
-                len(self.blocks) >= max_b or (self.blocks_len + b_len) > limit
+            old = self.blocks.pop(0)
+            self.blocks_len -= len(old)
+            target = getattr(old, "obj", None) or old
+            if (
+                isinstance(target, bytearray)
+                and len(target) == self.block_size
+                and self._free_count < len(self._free_blocks)
             ):
-                self.blocks_len -= len(self.blocks.pop(0))
+                self._free_blocks[self._free_count] = target
+                self._free_count += 1
 
+        if self._free_count > 0:
+            self._free_count -= 1
+            buf = self._free_blocks[self._free_count]
+            self._free_blocks[self._free_count] = None
+        else:
             _maybe_collect(4096)
-            b = bytes(block_data)
-            self.blocks.append(b)
-            self.blocks_len += b_len
+            buf = bytearray(self.block_size)
+
+        buf[:b_len] = block_data
+        self.blocks.append(buf if b_len == self.block_size else memoryview(buf)[:b_len])
+        self.blocks_len += b_len
 
         # Mode B: Write to scratch file ONLY when output_file is None/unseekable!
         if self.output_file is None and self.storage is not None:
@@ -1445,7 +1499,16 @@ class UnifiedHistory(HistoryBackend):
                 truncate_file_portable(self.scratch_file.name, history_total)
 
         # Truncate rotating blocks
-        self.blocks = []
+        while self.blocks:
+            old = self.blocks.pop()
+            target = getattr(old, "obj", None) or old
+            if (
+                isinstance(target, bytearray)
+                and len(target) == self.block_size
+                and self._free_count < len(self._free_blocks)
+            ):
+                self._free_blocks[self._free_count] = target
+                self._free_count += 1
         self.blocks_len = 0
 
     def sync(self):
@@ -1456,7 +1519,16 @@ class UnifiedHistory(HistoryBackend):
 
     def reset(self):
         self.total_written = 0
-        self.blocks = []
+        while self.blocks:
+            old = self.blocks.pop()
+            target = getattr(old, "obj", None) or old
+            if (
+                isinstance(target, bytearray)
+                and len(target) == self.block_size
+                and self._free_count < len(self._free_blocks)
+            ):
+                self._free_blocks[self._free_count] = target
+                self._free_count += 1
         self.blocks_len = 0
         if self.scratch_file is not None:
             if hasattr(self.scratch_file, "truncate"):
@@ -1616,6 +1688,7 @@ class RangeDecoder:
         pos = self.pos
         limit = self.limit
         symbol = 1
+        is_packed = isinstance(probs, bytearray)
         while symbol < 0x100:
             if mb >= 0:
                 mbit = (mb >> 7) & 1
@@ -1623,21 +1696,46 @@ class RangeDecoder:
                 idx = off + ((1 + mbit) << 8) + symbol
             else:
                 idx = off + symbol
-            prob = probs[idx]
+            if is_packed:
+                nyb_b = probs[768 + (idx >> 1)]
+                nyb = (nyb_b >> 4) if (idx & 1) else (nyb_b & 0x0F)
+                prob = (
+                    ((nyb & 0x07) << 8)
+                    if (nyb & 0x08)
+                    else (((nyb & 0x07) << 8) | probs[idx])
+                )
+            else:
+                prob = probs[idx]
             bound = (rng >> _PROB_BITS) * prob
             if code < bound:
                 rng = bound
-                probs[idx] = prob + ((_PROB_TOTAL - prob) >> 5)
+                new_prob = prob + ((_PROB_TOTAL - prob) >> 5)
                 symbol = symbol << 1
                 if mb >= 0 and mbit != 0:
                     mb = -1
             else:
                 rng -= bound
                 code -= bound
-                probs[idx] = prob - (prob >> _PROB_MOVE_BITS)
+                new_prob = prob - (prob >> _PROB_MOVE_BITS)
                 symbol = (symbol << 1) + 1
                 if mb >= 0 and mbit != 1:
                     mb = -1
+            if is_packed:
+                h3 = (new_prob >> 8) & 0x07
+                l8 = new_prob & 0xFF
+                n_idx = 768 + (idx >> 1)
+                if l8:
+                    probs[idx] = l8
+                    n_nyb = h3
+                else:
+                    n_nyb = 0x08 | h3
+                if idx & 1:
+                    probs[n_idx] = (nyb_b & 0x0F) | (n_nyb << 4)
+                else:
+                    probs[n_idx] = (nyb_b & 0xF0) | n_nyb
+            else:
+                probs[idx] = new_prob
+
             if rng < _RC_TOP_MASK:
                 rng = rng << 8
                 if pos < limit:
@@ -1729,8 +1827,9 @@ class XZStreamDecompressor:
         self.lc = 3
         self.lp = 0
         self.pb = 2
+        self._packed_lit = _should_pack_lit_tables()
         # Allocate probability tables first immediately following gc.collect() to claim clean heap spans
-        self.p_lit = _make_lit_tables(1 << (self.lc + self.lp))
+        self.p_lit = _make_lit_tables(1 << (self.lc + self.lp), packed=self._packed_lit)
         self._reinit_probs()
         self.cur_block = bytearray(self.block_size)
         self._exact_buf = bytearray(256)
@@ -2005,9 +2104,7 @@ class XZStreamDecompressor:
             ),
             "len_pcore": sum(len(arr) * 2 for arr in self._core_prob_arrays()),
             "len_plit": (
-                sum(len(sub) * 2 for sub in self.p_lit)
-                if isinstance(self.p_lit, list)
-                else len(self.p_lit) * 2
+                len(self.p_lit) * 1152 if isinstance(self.p_lit, list) else 1152
             ),
             "len_cblk": self.cur_block_pos,
             "len_inbuf": (
@@ -2127,13 +2224,19 @@ class XZStreamDecompressor:
         _fsync_fileobj(f_core)
         f_core.close()
 
-        # .plit (literal probability tables)
+        # .plit (literal probability tables - canonical 1152-byte on-disk format)
         f_lit = storage.open(f"{r_id}.plit", "wb")
         if isinstance(self.p_lit, list):
             for sub in self.p_lit:
-                f_lit.write(sub)
+                if isinstance(sub, bytearray):
+                    f_lit.write(sub)
+                else:
+                    f_lit.write(pack_1152_from_array(sub))
         else:
-            f_lit.write(self.p_lit)
+            if isinstance(self.p_lit, bytearray):
+                f_lit.write(self.p_lit)
+            else:
+                f_lit.write(pack_1152_from_array(self.p_lit))
         f_lit.flush()
         _fsync_fileobj(f_lit)
         f_lit.close()
@@ -2272,30 +2375,52 @@ class XZStreamDecompressor:
                             f_lit.seek(0, 2)
                             l_sz = f_lit.tell()
                             f_lit.seek(0)
-                            expected_sz = 0x300 << (engine.lc + engine.lp)
-                            exp_plit_len = state.get("len_plit", expected_sz * 2)
+                            num_tables = 1 << (engine.lc + engine.lp)
+                            exp_plit_len = state.get("len_plit", num_tables * 1152)
                             if l_sz < exp_plit_len:
                                 f_lit.close()
                                 raise XZResourceError(
                                     f"Corrupted plit: file size {l_sz} < recorded length {exp_plit_len}"
                                 )
-                            num_tables = 1 << (engine.lc + engine.lp)
+                            engine._packed_lit = _should_pack_lit_tables()
                             if getattr(engine, "p_lit", None) is None or (
                                 isinstance(engine.p_lit, list)
                                 and len(engine.p_lit) != num_tables
                             ):
-                                engine.p_lit = _make_lit_tables(num_tables)
+                                engine.p_lit = _make_lit_tables(
+                                    num_tables, packed=engine._packed_lit
+                                )
                             if isinstance(engine.p_lit, list):
                                 for sub in engine.p_lit:
-                                    n = f_lit.readinto(sub)
-                                    if n != len(sub) * 2:
+                                    if isinstance(sub, bytearray):
+                                        n = f_lit.readinto(sub)
+                                        if n != 1152:
+                                            raise XZResourceError(
+                                                "readinto failed for plit"
+                                            )
+                                    else:
+                                        tmp_1152 = bytearray(1152)
+                                        n = f_lit.readinto(tmp_1152)
+                                        if n != 1152:
+                                            raise XZResourceError(
+                                                "readinto failed for plit"
+                                            )
+                                        sub[:] = unpack_1152_to_array(tmp_1152)
+                            else:
+                                if isinstance(engine.p_lit, bytearray):
+                                    n = f_lit.readinto(engine.p_lit)
+                                    if n != 1152:
                                         raise XZResourceError(
                                             "readinto failed for plit"
                                         )
-                            else:
-                                n = f_lit.readinto(engine.p_lit)
-                                if n != len(engine.p_lit) * 2:
-                                    raise XZResourceError("readinto failed for plit")
+                                else:
+                                    tmp_1152 = bytearray(1152)
+                                    n = f_lit.readinto(tmp_1152)
+                                    if n != 1152:
+                                        raise XZResourceError(
+                                            "readinto failed for plit"
+                                        )
+                                    engine.p_lit[:] = unpack_1152_to_array(tmp_1152)
                             f_lit.close()
 
                         inbuf_name = (
@@ -2505,7 +2630,9 @@ class XZStreamDecompressor:
                             isinstance(self.p_lit, list)
                             and len(self.p_lit) != num_tables
                         ):
-                            self.p_lit = _make_lit_tables(num_tables)
+                            self.p_lit = _make_lit_tables(
+                                num_tables, packed=getattr(self, "_packed_lit", False)
+                            )
                         else:
                             _reset_lit_tables(self.p_lit)
                         self.state = 0
@@ -2579,7 +2706,9 @@ class XZStreamDecompressor:
                             isinstance(self.p_lit, list)
                             and len(self.p_lit) != num_tables
                         ):
-                            self.p_lit = _make_lit_tables(num_tables)
+                            self.p_lit = _make_lit_tables(
+                                num_tables, packed=getattr(self, "_packed_lit", False)
+                            )
                         else:
                             _reset_lit_tables(self.p_lit)
                         self.state = 0
@@ -3104,7 +3233,10 @@ class XZStreamDecompressor:
                                     isinstance(self.p_lit, list)
                                     and len(self.p_lit) != num_tables
                                 ):
-                                    self.p_lit = _make_lit_tables(num_tables)
+                                    self.p_lit = _make_lit_tables(
+                                        num_tables,
+                                        packed=getattr(self, "_packed_lit", False),
+                                    )
                                 else:
                                     _reset_lit_tables(self.p_lit)
                                 self.need_props = False
@@ -3165,13 +3297,7 @@ class XZStreamDecompressor:
                             if self.raw_rem == 0:
                                 self.in_chunk = False
                             if self.cur_block_pos == self.block_size:
-                                committed = bytes(self.cur_block)
-                                self._update_check(committed)
-                                self.history.append_block(committed, self.block_idx)
-                                self.overall_output_offset += len(committed)
-                                self.stream_out_offset += len(committed)
-                                self.block_idx += 1
-                                self.cur_block_pos = 0
+                                committed = self._commit_block()
                                 return committed, False
                         self.in_chunk = False
 
@@ -3248,17 +3374,7 @@ class XZStreamDecompressor:
                                     self.chunk_decoded += copy_len
                                     self.match_rem -= copy_len
                                     if self.cur_block_pos == self.block_size:
-                                        committed = bytes(self.cur_block)
-                                        self._update_check(committed)
-                                        self.history.append_block(
-                                            committed, self.block_idx
-                                        )
-                                        self.overall_output_offset += len(committed)
-                                        self.stream_out_offset += len(committed)
-                                        self.block_idx += 1
-                                        self.cur_block_pos = 0
-                                        if self.force_gc and (self.block_idx & 15) == 0:
-                                            _maybe_collect(4096)
+                                        committed = self._commit_block()
                                         self.rd_code = rd.code
                                         self.rd_range = rd.range
                                         if rd.buf is not None:
@@ -3507,15 +3623,7 @@ class XZStreamDecompressor:
                                     self.chunk_decoded += copy_len
                                     self.match_rem -= copy_len
                                     if self.cur_block_pos == self.block_size:
-                                        committed = bytes(self.cur_block)
-                                        self._update_check(committed)
-                                        self.history.append_block(
-                                            committed, self.block_idx
-                                        )
-                                        self.overall_output_offset += len(committed)
-                                        self.stream_out_offset += len(committed)
-                                        self.block_idx += 1
-                                        self.cur_block_pos = 0
+                                        committed = self._commit_block()
                                         self.rd_code = rd.code
                                         self.rd_range = rd.range
                                         if rd.buf is not None:
@@ -3785,6 +3893,7 @@ def format_size(n):
     return f"{n} B"
 
 
+@keep_if(_IS_DESKTOP_PY)
 def get_disk_info(path):
     p = Path(path).resolve()
     curr = p
@@ -3831,6 +3940,7 @@ def get_disk_info(path):
     return free_bytes, mount_desc, curr
 
 
+@keep_if(_IS_DESKTOP_PY)
 def estimate_uncompressed_size_and_dict(stream):
     if not hasattr(stream, "seek") or not hasattr(stream, "tell"):
         return None, None
@@ -3987,6 +4097,7 @@ def estimate_uncompressed_size_and_dict(stream):
     return None, None
 
 
+@keep_if(_IS_DESKTOP_PY)
 def check_preflight_disk_space(
     output_target,
     is_stream_output,
@@ -4133,21 +4244,22 @@ def decompress_xz(
     is_stream_input = (input_source == "-") or not is_seekable(in_stream)
 
     # Pre-flight disk space budgeting check
-    ok_space, space_msg, msg_type = check_preflight_disk_space(
-        output_target=output_target,
-        is_stream_output=is_stream_output,
-        in_stream=in_stream,
-        storage_dir=storage_dir,
-        resume_dir=resume_dir,
-        history_backend=history_backend,
-        available_mem=avail_mem,
-        ignore_space_check=ignore_space_check,
-    )
-    if not ok_space:
-        _write_err(f"xz_decompressor: E_RESOURCE: {space_msg}\n")
-        raise XZResourceError(space_msg)
-    elif space_msg and msg_type == "warning":
-        _write_err(f"xz_decompressor: warning: {space_msg}\n")
+    if _IS_DESKTOP_PY:
+        ok_space, space_msg, msg_type = check_preflight_disk_space(
+            output_target=output_target,
+            is_stream_output=is_stream_output,
+            in_stream=in_stream,
+            storage_dir=storage_dir,
+            resume_dir=resume_dir,
+            history_backend=history_backend,
+            available_mem=avail_mem,
+            ignore_space_check=ignore_space_check,
+        )
+        if not ok_space:
+            _write_err(f"xz_decompressor: E_RESOURCE: {space_msg}\n")
+            raise XZResourceError(space_msg)
+        elif space_msg and msg_type == "warning":
+            _write_err(f"xz_decompressor: warning: {space_msg}\n")
 
     def _compute_input_id(stream):
         if is_seekable(stream):
@@ -4252,7 +4364,7 @@ def decompress_xz(
     init_perf = _get_perf_counter()
     init_cpu = _get_process_time()
 
-    if deadline is not None:
+    if _IS_DESKTOP_PY and deadline is not None:
         deadline_epoch = parse_iso8601_flexible(deadline)
         now_epoch = time.time()
         deadline_remaining = max(0.0, deadline_epoch - now_epoch)
@@ -4369,13 +4481,19 @@ def decompress_xz(
         _fsync_fileobj(f_core)
         f_core.close()
 
-        # .plit
+        # .plit (canonical 1152-byte on-disk format)
         f_lit = storage.open(f"{prefix}.plit", "wb")
         if isinstance(engine_obj.p_lit, list):
             for sub in engine_obj.p_lit:
-                f_lit.write(sub)
+                if isinstance(sub, bytearray):
+                    f_lit.write(sub)
+                else:
+                    f_lit.write(pack_1152_from_array(sub))
         else:
-            f_lit.write(engine_obj.p_lit)
+            if isinstance(engine_obj.p_lit, bytearray):
+                f_lit.write(engine_obj.p_lit)
+            else:
+                f_lit.write(pack_1152_from_array(engine_obj.p_lit))
         f_lit.flush()
         _fsync_fileobj(f_lit)
         f_lit.close()
@@ -4587,8 +4705,8 @@ def decompress_xz(
                     f_core.close()
 
                 if storage.exists(f"{prefix}.plit"):
-                    expected_sz = 0x300 << (engine.lc + engine.lp)
-                    exp_plit_len = state_dict.get("len_plit", expected_sz * 2)
+                    num_tables = 1 << (engine.lc + engine.lp)
+                    exp_plit_len = state_dict.get("len_plit", num_tables * 1152)
                     f_lit = storage.open(f"{prefix}.plit", "rb")
                     f_lit.seek(0, 2)
                     l_sz = f_lit.tell()
@@ -4598,25 +4716,45 @@ def decompress_xz(
                         raise XZResourceError(
                             f"Corrupted plit: file size {l_sz} < recorded length {exp_plit_len}"
                         )
-                    num_tables = 1 << (engine.lc + engine.lp)
+                    engine._packed_lit = _should_pack_lit_tables(avail_mem)
                     if getattr(engine, "p_lit", None) is None or (
                         isinstance(engine.p_lit, list)
                         and len(engine.p_lit) != num_tables
                     ):
-                        engine.p_lit = _make_lit_tables(num_tables)
+                        engine.p_lit = _make_lit_tables(
+                            num_tables, packed=engine._packed_lit
+                        )
                     if isinstance(engine.p_lit, list):
                         for sub in engine.p_lit:
-                            n = f_lit.readinto(sub)
-                            if n != len(sub) * 2:
+                            if isinstance(sub, bytearray):
+                                n = f_lit.readinto(sub)
+                                if n != 1152:
+                                    raise XZResourceError(
+                                        "readinto failed for plit on checkpoint restore"
+                                    )
+                            else:
+                                tmp_1152 = bytearray(1152)
+                                n = f_lit.readinto(tmp_1152)
+                                if n != 1152:
+                                    raise XZResourceError(
+                                        "readinto failed for plit on checkpoint restore"
+                                    )
+                                sub[:] = unpack_1152_to_array(tmp_1152)
+                    else:
+                        if isinstance(engine.p_lit, bytearray):
+                            n = f_lit.readinto(engine.p_lit)
+                            if n != 1152:
                                 raise XZResourceError(
                                     "readinto failed for plit on checkpoint restore"
                                 )
-                    else:
-                        n = f_lit.readinto(engine.p_lit)
-                        if n != len(engine.p_lit) * 2:
-                            raise XZResourceError(
-                                "readinto failed for plit on checkpoint restore"
-                            )
+                        else:
+                            tmp_1152 = bytearray(1152)
+                            n = f_lit.readinto(tmp_1152)
+                            if n != 1152:
+                                raise XZResourceError(
+                                    "readinto failed for plit on checkpoint restore"
+                                )
+                            engine.p_lit[:] = unpack_1152_to_array(tmp_1152)
                     f_lit.close()
 
                 if storage.exists(f"{prefix}.cblk") and engine.cur_block_pos > 0:
@@ -5298,14 +5436,20 @@ if __debug__:
             self.test_stdout = io.StringIO()
             self.test_stderr = io.StringIO()
             if _IS_DESKTOP_PY:
-                self._orig_stderr = sys.stderr
-                self._orig_stdout = sys.stdout
-                self._fake_stdout = io.StringIO()
-                sys.stderr = io.StringIO()
-                sys.stdout = self._fake_stdout
-                self._orig_stdout_buffer = getattr(self._orig_stdout, "buffer", None)
-                if self._orig_stdout_buffer is not None:
-                    self._fake_stdout.buffer = io.BytesIO()
+                try:
+                    self._orig_stderr = getattr(sys, "stderr", None)
+                    self._orig_stdout = getattr(sys, "stdout", None)
+                    self._fake_stdout = io.StringIO()
+                    sys.stderr = io.StringIO()
+                    sys.stdout = self._fake_stdout
+                    self._orig_stdout_buffer = getattr(
+                        self._orig_stdout, "buffer", None
+                    )
+                    if self._orig_stdout_buffer is not None:
+                        self._fake_stdout.buffer = io.BytesIO()
+                except (AttributeError, TypeError):
+                    self._orig_stderr = None
+                    self._orig_stdout = None
 
         def tearDown(self):
             try:
@@ -5321,10 +5465,13 @@ if __debug__:
             except Exception:
                 pass
             if _IS_DESKTOP_PY:
-                if hasattr(self, "_orig_stderr"):
-                    sys.stderr = self._orig_stderr
-                if hasattr(self, "_orig_stdout"):
-                    sys.stdout = self._orig_stdout
+                try:
+                    if getattr(self, "_orig_stderr", None) is not None:
+                        sys.stderr = self._orig_stderr
+                    if getattr(self, "_orig_stdout", None) is not None:
+                        sys.stdout = self._orig_stdout
+                except (AttributeError, TypeError):
+                    pass
 
         def test_unified_history_engine_protocol(self):
             storage = MemoryStorage()
@@ -5421,11 +5568,11 @@ if __debug__:
             thawed.block_size = 4096
             thawed.cur_block = bytearray(4096)
 
-            out_blocks = [blk1]
+            out_blocks = [bytes(blk1)]
             while True:
                 b, is_eof = thawed.decode_block()
                 if b:
-                    out_blocks.append(b)
+                    out_blocks.append(bytes(b))
                     # Confirm subsequent blocks are at most the new 4 KiB size
                     self.assertLessEqual(len(b), 4096)
                 if is_eof:
@@ -5753,6 +5900,8 @@ if __debug__:
             out_target.unlink(missing_ok=True)
 
         def test_flexible_iso8601_parser(self):
+            if not _IS_DESKTOP_PY or parse_iso8601_flexible is None:
+                self.skipTest("parse_iso8601_flexible is desktop only")
             cases = [
                 ("20261008", 1791417600.0),
                 ("2026-10-08", 1791417600.0),
@@ -6105,6 +6254,8 @@ if __debug__:
                 list(engine_invalid.decode_events())
 
         def test_proves_right_claim5_compact_iso8601(self):
+            if not _IS_DESKTOP_PY or parse_iso8601_flexible is None:
+                self.skipTest("parse_iso8601_flexible is desktop only")
             # Proves that compact date notations without separators parse accurately
             ts1 = parse_iso8601_flexible("20261008123045")
             ts2 = parse_iso8601_flexible("20261008123045.500")
@@ -6663,6 +6814,8 @@ if __debug__:
                     list(engine.decode_events())
 
         def test_regression_preflight_disk_space_check(self):
+            if not _IS_DESKTOP_PY:
+                self.skipTest("preflight disk space check is desktop only")
             lzma = self.lzma
             import io
 
@@ -7140,6 +7293,7 @@ else:
     unittest = None
 
 
+@omit_if(_OMIT_MAIN)
 def _run_embedded_tests(
     argv=sys.argv, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr
 ):
@@ -7169,6 +7323,7 @@ def _run_embedded_tests(
     )
 
 
+@omit_if(_OMIT_MAIN)
 def main(argv=sys.argv, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr):
     args_list = argv[1:] if argv is sys.argv else argv
 
@@ -7671,5 +7826,6 @@ def main(argv=sys.argv, stdin=sys.stdin, stdout=sys.stdout, stderr=sys.stderr):
     return 0
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if not _OMIT_MAIN:
+    if __name__ == "__main__":
+        sys.exit(main())
